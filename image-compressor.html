@@ -1,0 +1,1552 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>画像一括圧縮</title>
+<!--
+==========================================================================
+ 画像一括圧縮ツール（単一HTML・オフライン動作・外部通信なし）
+==========================================================================
+【設計の要点】
+
+1. 形式の判定（推奨形式の決め方）
+   画像ごとに PNG と JPEG の両方を実際に作り、どちらも上限内に収めてから比べる。
+   比べる物差しは「元画像との見た目の差」= 画質スコア（SSIM。輝度80%＋色差20%、100が無劣化）。
+   縮小した候補は元の大きさに戻してから比べるので、解像度を落とした分も減点される。
+   - スコアの差が0.3以上 → 高い方
+   - ほぼ同じ → 解像度が高い方 → それも同じなら絵柄で判断
+     （隣り合う画素が同じ色の割合が50%以上＝スクショ・図版調ならPNG、それ以外はJPEG）
+   - 透過を含む画像は、JPEGにすると透過部分が白になるので PNG を初期選択する
+     （JPEGに切り替えた場合は白背景で合成し、警告を表示する）
+
+2. JPEG の処理
+   ブラウザ標準のエンコーダ（Canvas）で品質（整数1〜100）を二分探索し、上限以下で最も高い品質を選ぶ。
+   最低品質（初期値70）でも上限を超える場合は、ファイルサイズから縮小率を推定して縮小し、
+   収まる最大の解像度を二分探索で詰めてから、その解像度で品質を探索する。
+
+3. PNG の処理（PNGは可逆圧縮なので「品質」というパラメータは存在しない）
+   PNGのサイズを決めるのは「色の数」「絵柄の複雑さ」「画素数」だけ。そこで次の順に試す。
+   (a) 元がPNGで上限以下 → 無加工で通す
+   (b) 元の色数が256色以下 → パレットPNGに作り直す（色は一切変えない＝無劣化）
+   (c) 減色：メディアンカット＋k-means で256色→128→64→32…と色数を減らし（下限は設定、初期値32色）、
+       収まる最大の色数を探す
+   (d) それでも収まらなければ256色のまま段階的に縮小し、収まる最大の解像度を探す
+   (c)と(d)の両方が作れた場合は画質スコアの高い方を採る。
+   ※ Canvas はパレット（インデックスカラー）PNGを書き出せないため、PNGエンコーダは自前で実装し、
+     圧縮部分だけブラウザ標準の CompressionStream（deflate）を使う。
+
+   【PNGの限界】写真調・グラデーションの多い画像（AI生成画像の大半）は、
+   減色すると帯状のムラ（バンディング）が出やすく、画素ごとの変化が多いため圧縮も効きにくい。
+   120KBに収めるには大きく縮小するしかないことが多く、その場合はJPEGの方がスコアが高くなる。
+   逆にスクショ（平坦な色・文字）は少ない色数で原寸のまま収まりやすく、JPEGより文字がにじまない。
+
+4. 処理の流れ・安全性
+   重い処理は Web Worker（使えない環境では画面側で少しずつ）で1件ずつ行い、画面は固まらない。
+   画像は File API → createImageBitmap → Canvas で処理し、通信処理は一切持たない。
+
+5. メモリ
+   元画像の画素データとCanvasは1件ごとに破棄する。一覧のサムネイルは小さなJPEGで保持し、
+   比較表示や保存で作ったオブジェクトURLは使い終わったら解放する。
+
+6. 出力
+   元のファイル名（8桁の日付）を維持し、拡張子だけ .png / .jpg に変える。
+   同名が衝突したら _2, _3 … を付ける（大文字小文字は区別しない）。
+   ZIPは自前で組み立てる無圧縮格納（中身は圧縮済みの画像なので無圧縮で十分）。
+   上限は初期値で 1KB=1000バイト（厳しい側）で判定する。設定で1024バイトにも切り替えられる。
+==========================================================================
+-->
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect x='3' y='5' width='26' height='22' rx='4' fill='%231f5bd6'/%3E%3Cpath d='M7 23l6-7 4 4 3-3 5 6z' fill='%23fff'/%3E%3Ccircle cx='21' cy='11' r='2.5' fill='%23fff'/%3E%3C/svg%3E">
+<style>
+:root {
+  --bg: #f3f4f6;
+  --surface: #ffffff;
+  --surface-2: #f8f9fb;
+  --ink: #1a2130;
+  --muted: #5c6577;
+  --faint: #8a93a3;
+  --line: #e2e5eb;
+  --line-strong: #c8cdd7;
+  --accent: #1f5bd6;
+  --accent-ink: #ffffff;
+  --accent-soft: #e9f0fd;
+  --ok: #157347;
+  --ok-soft: #e4f3eb;
+  --warn: #965500;
+  --warn-soft: #fdf0dc;
+  --danger: #b3261e;
+  --danger-soft: #fbe8e6;
+  --info-soft: #eef0f4;
+  --check-a: #e9ebef;
+  --check-b: #ffffff;
+  --shadow: 0 1px 2px rgba(16,24,40,.05), 0 2px 6px rgba(16,24,40,.06);
+  --radius: 10px;
+  color-scheme: light;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #12151b; --surface: #1a1f27; --surface-2: #20262f; --ink: #e6e9ef; --muted: #a3abb9; --faint: #7d8696;
+    --line: #2c333e; --line-strong: #3d4552; --accent: #7aa2f7; --accent-ink: #0d1320; --accent-soft: #1d2a44;
+    --ok: #5cc48e; --ok-soft: #173326; --warn: #f0b35a; --warn-soft: #3a2a12; --danger: #f2877e; --danger-soft: #3d1c1a;
+    --info-soft: #262c36; --check-a: #2a303a; --check-b: #222831; --shadow: 0 1px 2px rgba(0,0,0,.3), 0 2px 8px rgba(0,0,0,.25);
+    color-scheme: dark;
+  }
+}
+:root[data-theme="dark"] {
+  --bg: #12151b; --surface: #1a1f27; --surface-2: #20262f; --ink: #e6e9ef; --muted: #a3abb9; --faint: #7d8696;
+  --line: #2c333e; --line-strong: #3d4552; --accent: #7aa2f7; --accent-ink: #0d1320; --accent-soft: #1d2a44;
+  --ok: #5cc48e; --ok-soft: #173326; --warn: #f0b35a; --warn-soft: #3a2a12; --danger: #f2877e; --danger-soft: #3d1c1a;
+  --info-soft: #262c36; --check-a: #2a303a; --check-b: #222831; --shadow: 0 1px 2px rgba(0,0,0,.3), 0 2px 8px rgba(0,0,0,.25);
+  color-scheme: dark;
+}
+* { box-sizing: border-box; }
+html, body { margin: 0; }
+body {
+  background: var(--bg);
+  color: var(--ink);
+  font-family: "Segoe UI", "Yu Gothic UI", "Meiryo UI", "Hiragino Sans", system-ui, sans-serif;
+  font-size: 14px;
+  line-height: 1.55;
+  -webkit-text-size-adjust: 100%;
+}
+.num { font-variant-numeric: tabular-nums; }
+.wrap { max-width: 1160px; margin: 0 auto; padding: 0 16px; }
+button { font: inherit; color: inherit; }
+.btn {
+  display: inline-flex; align-items: center; justify-content: center; gap: 6px;
+  min-height: 36px; padding: 0 14px; border-radius: 8px;
+  border: 1px solid var(--line-strong); background: var(--surface); color: var(--ink);
+  cursor: pointer; white-space: nowrap;
+}
+.btn:hover { border-color: var(--accent); }
+.btn:focus-visible, .opt:focus-visible, .chip:focus-visible, .seg button:focus-visible, .drop:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.btn.primary { background: var(--accent); border-color: var(--accent); color: var(--accent-ink); font-weight: 600; }
+.btn.primary:hover { filter: brightness(1.06); }
+.btn.ghost { border-color: transparent; background: transparent; color: var(--muted); }
+.btn.ghost:hover { color: var(--ink); background: var(--info-soft); }
+.btn.small { min-height: 30px; padding: 0 10px; font-size: 13px; }
+.btn:disabled { opacity: .45; cursor: not-allowed; }
+
+/* ---------- header ---------- */
+.top { background: var(--surface); border-bottom: 1px solid var(--line); }
+.top .wrap { display: flex; flex-wrap: wrap; align-items: baseline; gap: 6px 16px; padding-top: 18px; padding-bottom: 16px; }
+.top h1 { font-size: 20px; margin: 0; letter-spacing: .02em; }
+.top .lead { margin: 0; color: var(--muted); }
+.pill { display: inline-flex; align-items: center; gap: 6px; padding: 2px 10px; border-radius: 999px; background: var(--ok-soft); color: var(--ok); font-size: 12px; font-weight: 600; }
+.top .pill { margin-left: auto; }
+
+main.wrap { padding-top: 20px; padding-bottom: 120px; }
+.card { background: var(--surface); border: 1px solid var(--line); border-radius: var(--radius); box-shadow: var(--shadow); }
+.notice { padding: 12px 16px; margin-bottom: 16px; border-radius: var(--radius); background: var(--danger-soft); color: var(--danger); }
+
+/* ---------- intake ---------- */
+.intake { display: grid; grid-template-columns: 1fr; gap: 12px; }
+.drop {
+  display: flex; flex-direction: column; align-items: center; justify-content: center; text-align: center; gap: 6px;
+  min-height: 190px; padding: 24px 16px; border: 2px dashed var(--line-strong); border-radius: 14px; background: var(--surface);
+  transition: border-color .15s, background .15s;
+}
+.drop.over { border-color: var(--accent); background: var(--accent-soft); }
+.drop svg { width: 40px; height: 40px; color: var(--accent); }
+.drop strong { font-size: 17px; }
+.drop .sub { color: var(--muted); }
+.drop-actions { display: flex; flex-wrap: wrap; gap: 8px; justify-content: center; margin-top: 8px; }
+.limits { display: flex; flex-wrap: wrap; justify-content: center; gap: 8px; margin-top: 2px; }
+.limit-chip { padding: 2px 10px; border-radius: 999px; background: var(--info-soft); color: var(--muted); font-size: 12px; }
+.limit-chip b { color: var(--ink); }
+
+.panels { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+details.panel { background: var(--surface); border: 1px solid var(--line); border-radius: var(--radius); }
+details.panel > summary { list-style: none; cursor: pointer; padding: 12px 16px; font-weight: 600; display: flex; align-items: center; gap: 8px; }
+details.panel > summary::-webkit-details-marker { display: none; }
+details.panel > summary::before { content: ""; width: 7px; height: 7px; border-right: 2px solid var(--muted); border-bottom: 2px solid var(--muted); transform: rotate(-45deg); transition: transform .15s; margin-right: 2px; }
+details.panel[open] > summary::before { transform: rotate(45deg); }
+details.panel > summary { white-space: nowrap; }
+details.panel > summary .sumnote { margin-left: auto; font-weight: 400; color: var(--muted); font-size: 12px; overflow: hidden; text-overflow: ellipsis; min-width: 0; }
+.panel-body { padding: 0 16px 16px; }
+.fields { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px 16px; }
+.field label { display: block; font-size: 12px; color: var(--muted); margin-bottom: 4px; }
+.field .inrow { display: flex; align-items: center; gap: 6px; }
+.field input[type=number], .field select {
+  width: 100%; min-height: 34px; padding: 4px 8px; border-radius: 7px; border: 1px solid var(--line-strong);
+  background: var(--surface); color: var(--ink); font: inherit;
+}
+.field .unit { color: var(--muted); white-space: nowrap; }
+.field.wide { grid-column: 1 / -1; }
+.radio-row { display: flex; flex-wrap: wrap; gap: 6px 16px; }
+.radio-row label { display: inline-flex; align-items: center; gap: 6px; font-size: 13px; color: var(--ink); margin: 0; }
+.panel-actions { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-top: 14px; }
+.dirty-note { color: var(--warn); font-size: 12px; }
+.howto ul { margin: 0; padding-left: 1.2em; color: var(--ink); }
+.howto li { margin: 0 0 6px; }
+.howto li span { color: var(--muted); }
+
+/* ---------- progress ---------- */
+.progress { padding: 14px 16px; margin-top: 16px; }
+.prog-head { display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px 12px; }
+.prog-head strong { font-size: 15px; }
+.prog-head .time { color: var(--muted); margin-left: auto; font-size: 13px; }
+.bar { height: 8px; background: var(--info-soft); border-radius: 999px; overflow: hidden; margin: 10px 0 8px; }
+.bar-fill { height: 100%; width: 0; background: var(--accent); border-radius: 999px; transition: width .25s; }
+.prog-now { list-style: none; margin: 0; padding: 0; display: grid; gap: 2px; font-size: 13px; color: var(--muted); }
+.prog-now li { display: flex; gap: 8px; min-width: 0; }
+.prog-now b { color: var(--ink); font-weight: 600; flex: none; }
+.prog-now span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.spin { display: inline-block; width: 12px; height: 12px; border: 2px solid var(--line-strong); border-top-color: var(--accent); border-radius: 50%; animation: spin .8s linear infinite; vertical-align: -1px; flex: none; }
+@keyframes spin { to { transform: rotate(360deg); } }
+
+/* ---------- results ---------- */
+.results { margin-top: 16px; }
+.toolbar { padding: 12px 16px; display: flex; flex-wrap: wrap; gap: 10px 16px; align-items: center; border-bottom: 1px solid var(--line); }
+.stats { display: flex; flex-wrap: wrap; gap: 4px 14px; font-size: 13px; color: var(--muted); }
+.stats b { color: var(--ink); }
+.tools { display: flex; flex-wrap: wrap; gap: 8px 12px; align-items: center; margin-left: auto; }
+.chips, .seg { display: inline-flex; border: 1px solid var(--line-strong); border-radius: 8px; overflow: hidden; background: var(--surface); }
+.chip, .seg button { border: 0; background: transparent; padding: 5px 10px; cursor: pointer; font-size: 13px; color: var(--muted); white-space: nowrap; }
+.chip + .chip, .seg button + button { border-left: 1px solid var(--line); }
+.chip[aria-pressed="true"], .seg button[aria-pressed="true"] { background: var(--accent-soft); color: var(--accent); font-weight: 600; }
+.chip .c { margin-left: 4px; font-variant-numeric: tabular-nums; }
+.bulk { display: inline-flex; align-items: center; gap: 6px; font-size: 13px; color: var(--muted); }
+
+.list-head, .row {
+  display: grid;
+  grid-template-columns: 64px minmax(150px, 1.15fr) minmax(270px, 1.6fr) minmax(170px, 1.2fr) 112px;
+  gap: 14px; align-items: center; padding: 12px 16px;
+}
+.list-head { padding-top: 8px; padding-bottom: 8px; font-size: 12px; color: var(--muted); border-bottom: 1px solid var(--line); background: var(--surface-2); }
+.row { border-bottom: 1px solid var(--line); }
+.row:last-child { border-bottom: 0; }
+.row.hide { display: none; }
+.thumb { width: 64px; height: 64px; border-radius: 8px; background: var(--info-soft); overflow: hidden; display: flex; align-items: center; justify-content: center; }
+.thumb img { width: 100%; height: 100%; object-fit: cover; display: block; }
+.fname { font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.meta { font-size: 12px; color: var(--muted); }
+.state { font-size: 13px; color: var(--muted); display: flex; align-items: center; gap: 8px; }
+.state.err { color: var(--danger); }
+
+.choose { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+.opt {
+  position: relative; text-align: left; border: 1px solid var(--line-strong); border-radius: 9px; background: var(--surface);
+  padding: 7px 10px 8px; cursor: pointer; display: grid; gap: 1px; min-width: 0;
+}
+.opt:hover { border-color: var(--accent); }
+.opt[aria-pressed="true"] { border-color: var(--accent); box-shadow: inset 0 0 0 1px var(--accent); background: var(--accent-soft); }
+.opt:disabled { cursor: not-allowed; opacity: .55; background: var(--surface-2); }
+.opt .o-top { display: flex; align-items: center; gap: 6px; font-size: 12px; color: var(--muted); }
+.opt .o-top b { color: var(--ink); font-size: 12px; letter-spacing: .04em; }
+.opt[aria-pressed="true"] .o-top b { color: var(--accent); }
+.opt .o-score { margin-left: auto; font-variant-numeric: tabular-nums; white-space: nowrap; }
+.opt .o-score.low { color: var(--warn); font-weight: 600; }
+.opt .tag { white-space: nowrap; flex: none; font-size: 11px; padding: 0 6px; border-radius: 999px; background: var(--ok-soft); color: var(--ok); font-weight: 600; }
+.opt .o-size { font-size: 16px; font-weight: 600; font-variant-numeric: tabular-nums; }
+.opt .o-sub { font-size: 12px; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.meter { height: 3px; background: var(--info-soft); border-radius: 999px; overflow: hidden; margin-top: 3px; }
+.meter i { display: block; height: 100%; background: var(--ok); border-radius: 999px; }
+.opt .o-err { font-size: 12px; color: var(--danger); }
+
+.oname { font-weight: 600; font-variant-numeric: tabular-nums; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.badges { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 4px; }
+.badge { font-size: 11px; padding: 1px 7px; border-radius: 999px; background: var(--info-soft); color: var(--muted); white-space: nowrap; }
+.badge.ok { background: var(--ok-soft); color: var(--ok); }
+.badge.warn { background: var(--warn-soft); color: var(--warn); font-weight: 600; }
+.badge.err { background: var(--danger-soft); color: var(--danger); font-weight: 600; }
+.acts { display: flex; gap: 6px; justify-content: flex-end; }
+.empty { padding: 28px 16px; text-align: center; color: var(--muted); }
+
+/* ---------- save bar ---------- */
+.savebar { position: fixed; left: 0; right: 0; bottom: 0; background: var(--surface); border-top: 1px solid var(--line); box-shadow: 0 -4px 14px rgba(16,24,40,.08); z-index: 20; }
+.savebar-in { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 16px; padding-top: 12px; padding-bottom: 12px; }
+.save-msg { color: var(--muted); font-size: 13px; }
+.save-msg b { color: var(--ink); }
+.save-btns { display: flex; flex-wrap: wrap; gap: 8px; margin-left: auto; }
+
+/* ---------- compare dialog ---------- */
+dialog.cmp { width: min(1120px, 96vw); height: min(92vh, 980px); max-height: 92vh; padding: 0; border: 1px solid var(--line); border-radius: 14px; background: var(--surface); color: var(--ink); box-shadow: 0 20px 60px rgba(0,0,0,.3); }
+dialog.cmp[open] { display: flex; flex-direction: column; }
+dialog.cmp::backdrop { background: rgba(10,14,22,.55); }
+.cmp-head { display: flex; align-items: center; gap: 12px; padding: 12px 16px; border-bottom: 1px solid var(--line); }
+.cmp-title { font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.cmp-head .btn { margin-left: auto; }
+.cmp-bar { display: flex; flex-wrap: wrap; gap: 8px 12px; align-items: center; padding: 10px 16px; border-bottom: 1px solid var(--line); }
+.cmp-bar .seg button { padding: 6px 12px; }
+.cmp-info { font-size: 13px; color: var(--muted); padding: 8px 16px; border-bottom: 1px solid var(--line); min-height: 38px; }
+.cmp-info b { color: var(--ink); }
+.cmp-info .warn { color: var(--warn); font-weight: 600; }
+.cmp-view {
+  flex: 1; min-height: 0; overflow: auto; padding: 12px;
+  background-color: var(--check-b);
+  background-image: linear-gradient(45deg, var(--check-a) 25%, transparent 25%), linear-gradient(-45deg, var(--check-a) 25%, transparent 25%), linear-gradient(45deg, transparent 75%, var(--check-a) 75%), linear-gradient(-45deg, transparent 75%, var(--check-a) 75%);
+  background-size: 16px 16px; background-position: 0 0, 0 8px, 8px -8px, -8px 0;
+}
+.cmp-view img { display: block; margin: 0 auto; height: auto; }
+.cmp-view img.pix { image-rendering: pixelated; }
+.cmp-foot { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 12px; padding: 10px 16px; border-top: 1px solid var(--line); }
+.cmp-foot .hint { color: var(--muted); font-size: 12px; }
+.cmp-foot .btn { margin-left: auto; }
+
+.toast { position: fixed; left: 50%; bottom: 84px; transform: translateX(-50%); background: var(--ink); color: var(--surface); padding: 10px 16px; border-radius: 10px; font-size: 13px; z-index: 50; max-width: calc(100vw - 32px); box-shadow: var(--shadow); opacity: 0; pointer-events: none; transition: opacity .2s; }
+.toast.show { opacity: 1; }
+.sr { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; }
+
+@media (max-width: 860px) {
+  .panels { grid-template-columns: 1fr; }
+  .list-head { display: none; }
+  .row { grid-template-columns: 56px minmax(0, 1fr); grid-template-areas: "thumb src" "choose choose" "out out" "acts acts"; gap: 10px 12px; }
+  .row > .c-thumb { grid-area: thumb; }
+  .row > .c-src { grid-area: src; min-width: 0; }
+  .row > .c-choose { grid-area: choose; }
+  .row > .c-out { grid-area: out; }
+  .row > .c-acts { grid-area: acts; }
+  .thumb { width: 56px; height: 56px; }
+  .acts { justify-content: flex-start; }
+  .tools { margin-left: 0; }
+}
+@media (max-width: 520px) {
+  .fields { grid-template-columns: 1fr; }
+  .save-btns { margin-left: 0; width: 100%; }
+  .save-btns .btn { flex: 1 1 auto; }
+  .top .pill { margin-left: 0; }
+}
+@media (prefers-reduced-motion: reduce) { .spin { animation: none; } .bar-fill, .drop { transition: none; } }
+</style>
+</head>
+<body>
+<header class="top">
+  <div class="wrap">
+    <h1>画像一括圧縮</h1>
+    <p class="lead">PNG / JPEG を上限サイズ以内に自動で変換します</p>
+    <span class="pill" title="画像はこのPCのブラウザの中だけで処理し、外部へは送信しません">
+      <svg width="12" height="12" viewBox="0 0 16 16" aria-hidden="true"><path fill="currentColor" d="M8 1 2 3.5v4C2 11 4.6 14 8 15c3.4-1 6-4 6-7.5v-4L8 1Zm-1 10L4.3 8.3l1.1-1.1L7 8.8l3.6-3.6 1.1 1.1L7 11Z"/></svg>
+      端末内だけで処理
+    </span>
+  </div>
+</header>
+
+<main class="wrap">
+  <div id="capNotice" class="notice" hidden></div>
+
+  <section class="intake">
+    <div id="drop" class="drop" tabindex="0" aria-label="画像をドロップ、またはクリックしてファイルを選択">
+      <svg viewBox="0 0 48 48" fill="none" aria-hidden="true"><rect x="6" y="9" width="36" height="30" rx="5" stroke="currentColor" stroke-width="2.4"/><path d="m11 34 9-10 6 6 4-4 7 8" stroke="currentColor" stroke-width="2.4" stroke-linejoin="round"/><circle cx="31" cy="18" r="3.2" stroke="currentColor" stroke-width="2.4"/></svg>
+      <strong>画像をここにドロップ</strong>
+      <span class="sub">フォルダごとドロップしても読み込めます（100件程度をまとめて処理できます）</span>
+      <div class="limits" id="limitChips"></div>
+      <div class="drop-actions">
+        <button type="button" class="btn primary" id="pickFiles">ファイルを選択</button>
+        <button type="button" class="btn" id="pickDir">フォルダを選択</button>
+      </div>
+      <input type="file" id="fileInput" accept="image/*,.png,.jpg,.jpeg,.webp,.gif,.bmp" multiple hidden>
+      <input type="file" id="dirInput" webkitdirectory multiple hidden>
+    </div>
+
+    <div class="panels">
+      <details class="panel" id="settingsPanel">
+        <summary>設定 <span class="sumnote" id="settingsSum"></span></summary>
+        <div class="panel-body">
+          <div class="fields">
+            <div class="field">
+              <label for="sJpg">JPEGの上限</label>
+              <div class="inrow"><input type="number" id="sJpg" min="10" max="10000" step="1"><span class="unit">KB</span></div>
+            </div>
+            <div class="field">
+              <label for="sPng">PNGの上限</label>
+              <div class="inrow"><input type="number" id="sPng" min="10" max="10000" step="1"><span class="unit">KB</span></div>
+            </div>
+            <div class="field wide">
+              <label>1KBの数え方</label>
+              <div class="radio-row">
+                <label><input type="radio" name="sUnit" value="1000"> 1KB = 1000バイト（厳しい側・推奨）</label>
+                <label><input type="radio" name="sUnit" value="1024"> 1KB = 1024バイト</label>
+              </div>
+            </div>
+            <div class="field">
+              <label for="sQ">JPEGの最低品質（これより下げる前に縮小）</label>
+              <div class="inrow"><input type="number" id="sQ" min="30" max="95" step="1"><span class="unit">/ 100</span></div>
+            </div>
+            <div class="field">
+              <label for="sK">PNGの最少色数（これより減らす前に縮小）</label>
+              <select id="sK">
+                <option value="256">256色</option>
+                <option value="128">128色</option>
+                <option value="64">64色</option>
+                <option value="32">32色</option>
+                <option value="16">16色</option>
+              </select>
+            </div>
+          </div>
+          <div class="panel-actions">
+            <button type="button" class="btn small" id="sReset">初期値に戻す</button>
+            <button type="button" class="btn small primary" id="sApply" hidden>この設定で再処理</button>
+            <span class="dirty-note" id="dirtyNote" hidden>設定を変えました。再処理すると反映されます。</span>
+          </div>
+        </div>
+      </details>
+
+      <details class="panel howto">
+        <summary>判定のしくみ</summary>
+        <div class="panel-body">
+          <ul>
+            <li>画像ごとに PNG と JPEG の両方を実際に作り、どちらも上限内に収めてから比べます。</li>
+            <li>比べる基準は元画像との見た目の差（画質スコア、100が劣化なし）です。<span>縮小した候補は元の大きさに戻して比べるので、縮小した分も減点されます。</span></li>
+            <li>JPEG は品質を二分探索し、上限ギリギリで一番高い品質を選びます。<span>最低品質でも収まらないときだけ縮小します。</span></li>
+            <li>PNG には品質の設定がありません。色数を減らし（減色）、それでも収まらなければ縮小します。<span>写真調・グラデーションの画像は減色でムラが出て圧縮も効きにくいため、たいてい JPEG が選ばれます。スクショは少ない色数で原寸のまま収まりやすく、PNG が選ばれやすくなります。</span></li>
+            <li>透過のある画像は PNG を初期選択します。<span>JPEG に切り替えると透過部分は白になります。</span></li>
+            <li>ファイル名は元の名前のまま、拡張子だけ変えます。<span>同じ名前になる場合は _2, _3 … を付けます。</span></li>
+          </ul>
+        </div>
+      </details>
+    </div>
+  </section>
+
+  <section id="progress" class="card progress" hidden aria-live="polite">
+    <div class="prog-head">
+      <strong id="progCount" class="num"></strong>
+      <span id="progLabel"></span>
+      <span class="time num" id="progTime"></span>
+    </div>
+    <div class="bar" role="progressbar" aria-label="処理の進み具合" aria-valuemin="0" aria-valuemax="100" id="progBarWrap"><div class="bar-fill" id="progBar"></div></div>
+    <ul class="prog-now" id="progNow"></ul>
+  </section>
+
+  <section id="results" class="card results" hidden>
+    <div class="toolbar">
+      <div class="stats num" id="stats"></div>
+      <div class="tools">
+        <div class="chips" id="filters" role="group" aria-label="表示の絞り込み">
+          <button type="button" class="chip" data-f="all" aria-pressed="true">すべて<span class="c" data-c="all"></span></button>
+          <button type="button" class="chip" data-f="attn" aria-pressed="false">要確認<span class="c" data-c="attn"></span></button>
+          <button type="button" class="chip" data-f="shrink" aria-pressed="false">縮小あり<span class="c" data-c="shrink"></span></button>
+          <button type="button" class="chip" data-f="err" aria-pressed="false">エラー<span class="c" data-c="err"></span></button>
+        </div>
+        <div class="bulk"><span>表示中を一括で</span>
+          <div class="seg" role="group" aria-label="形式を一括で選ぶ">
+            <button type="button" data-bulk="rec">推奨</button><button type="button" data-bulk="png">PNG</button><button type="button" data-bulk="jpeg">JPEG</button>
+          </div>
+        </div>
+        <button type="button" class="btn ghost small" id="clearAll">すべて消去</button>
+      </div>
+    </div>
+    <div class="list-head" aria-hidden="true">
+      <div></div><div>元画像</div><div>出力形式（クリックで切り替え）</div><div>出力ファイル</div><div></div>
+    </div>
+    <div id="list" role="list"></div>
+  </section>
+</main>
+
+<div class="savebar" id="savebar" hidden>
+  <div class="wrap savebar-in">
+    <div class="save-msg" id="saveMsg"></div>
+    <div class="save-btns">
+      <button type="button" class="btn primary" id="saveZip">ZIPでまとめて保存</button>
+      <button type="button" class="btn" id="saveDir" hidden>フォルダを選んで保存</button>
+      <button type="button" class="btn" id="saveEach">1件ずつ保存</button>
+    </div>
+  </div>
+</div>
+
+<dialog class="cmp" id="cmp" aria-labelledby="cmpTitle">
+  <div class="cmp-head">
+    <div class="cmp-title" id="cmpTitle"></div>
+    <button type="button" class="btn small" id="cmpClose">閉じる</button>
+  </div>
+  <div class="cmp-bar">
+    <div class="seg" id="cmpVer" role="group" aria-label="表示する画像">
+      <button type="button" data-v="orig">1 元画像</button><button type="button" data-v="png">2 PNG</button><button type="button" data-v="jpeg">3 JPEG</button>
+    </div>
+    <div class="seg" id="cmpZoom" role="group" aria-label="表示倍率">
+      <button type="button" data-z="fit">全体</button><button type="button" data-z="1">100%</button><button type="button" data-z="2">200%</button>
+    </div>
+  </div>
+  <div class="cmp-info" id="cmpInfo"></div>
+  <div class="cmp-view" id="cmpView"><img id="cmpImg" alt=""></div>
+  <div class="cmp-foot">
+    <span class="hint">キーの 1・2・3 で切り替えると、同じ位置で見比べられます</span>
+    <button type="button" class="btn primary" id="cmpAdopt">この形式を採用</button>
+  </div>
+</dialog>
+
+<div class="toast" id="toast" role="status" aria-live="polite"></div>
+
+<!-- ======================= 処理エンジン（Web Worker として起動） ======================= -->
+<script type="text/plain" id="engine-src">
+'use strict';
+var MAX_PIXELS = 25000000;   // これを超える画像は読み込み時に縮小（メモリ保護）
+var REF_CAP = 2000000;       // 画質スコアを計算する解像度の上限
+var WR = 2, WG = 4, WB = 3, WA = 3;  // 色の距離の重み（人の目の感度に合わせて緑を重く）
+var CACHE = null;
+
+/* ---------- CRC32 ---------- */
+var CRC_TABLE = (function () {
+  var t = new Uint32Array(256);
+  for (var n = 0; n < 256; n++) { var c = n; for (var k = 0; k < 8; k++) c = (c & 1) ? (0xEDB88320 ^ (c >>> 1)) : (c >>> 1); t[n] = c >>> 0; }
+  return t;
+})();
+function crc32(crc, u8) {
+  var c = (crc ^ 0xFFFFFFFF) >>> 0;
+  for (var i = 0; i < u8.length; i++) c = CRC_TABLE[(c ^ u8[i]) & 0xFF] ^ (c >>> 8);
+  return (c ^ 0xFFFFFFFF) >>> 0;
+}
+
+/* ---------- Canvas ---------- */
+function makeCanvas(w, h) {
+  if (typeof OffscreenCanvas !== 'undefined') return new OffscreenCanvas(w, h);
+  var c = document.createElement('canvas'); c.width = w; c.height = h; return c;
+}
+function ctx2d(c) { return c.getContext('2d', { willReadFrequently: true }); }
+function freeCanvas(c) { if (c) { try { c.width = 1; c.height = 1; } catch (e) {} } }
+function toBlob(c, type, q) {
+  if (c.convertToBlob) return c.convertToBlob({ type: type, quality: q });
+  return new Promise(function (res, rej) {
+    c.toBlob(function (b) { if (b) res(b); else rej(new Error('画像の書き出しに失敗しました')); }, type, q);
+  });
+}
+function dimsAt(W, H, s) { return { w: Math.max(1, Math.round(W * s)), h: Math.max(1, Math.round(H * s)) }; }
+function pct(s) { return Math.round(s * 100) + '%'; }
+// 縮小（2分の1ずつ段階的に縮めてから最終サイズへ。一度に大きく縮めたときのギザつきを防ぐ）
+function scaleCanvas(src, sw, sh, tw, th, white) {
+  var cur = src, cw = sw, ch = sh, tmp = [];
+  while (cw >= tw * 2 && ch >= th * 2) {
+    var nw = Math.max(tw, Math.round(cw / 2)), nh = Math.max(th, Math.round(ch / 2));
+    var c = makeCanvas(nw, nh), g = c.getContext('2d');
+    g.imageSmoothingEnabled = true; g.imageSmoothingQuality = 'high';
+    g.drawImage(cur, 0, 0, cw, ch, 0, 0, nw, nh);
+    tmp.push(c); cur = c; cw = nw; ch = nh;
+  }
+  var out = makeCanvas(tw, th), go = ctx2d(out);
+  if (white) { go.fillStyle = '#ffffff'; go.fillRect(0, 0, tw, th); }
+  go.imageSmoothingEnabled = true; go.imageSmoothingQuality = 'high';
+  go.drawImage(cur, 0, 0, cw, ch, 0, 0, tw, th);
+  for (var i = 0; i < tmp.length; i++) freeCanvas(tmp[i]);
+  return out;
+}
+
+/* ---------- 形式の判別・画像の特徴 ---------- */
+function sniff(h) {
+  if (h[0] === 0x89 && h[1] === 0x50 && h[2] === 0x4E && h[3] === 0x47) return 'png';
+  if (h[0] === 0xFF && h[1] === 0xD8 && h[2] === 0xFF) return 'jpeg';
+  return 'other';
+}
+function analyze(data, W, H) {
+  var u32 = new Uint32Array(data.buffer, data.byteOffset, data.byteLength >> 2), n = u32.length, i;
+  var hasAlpha = false;
+  for (i = 0; i < n; i++) if ((u32[i] >>> 24) !== 255) { hasAlpha = true; break; }
+  var same = 0;
+  for (var y = 0; y < H; y++) { var o = y * W; for (var x = 1; x < W; x++) if (u32[o + x] === u32[o + x - 1]) same++; }
+  var flat = W > 1 ? same / ((W - 1) * H) : 0;
+  var map = new Map(), prev = -1, over = false;
+  for (i = 0; i < n; i++) {
+    var v = u32[i]; if ((v >>> 24) === 0) v = 0;
+    if (v === prev) continue; prev = v;
+    if (!map.has(v)) { if (map.size >= 256) { over = true; break; } map.set(v, map.size); }
+  }
+  return { hasAlpha: hasAlpha, flat: flat, exact: over ? null : map };
+}
+
+/* ---------- PNG エンコーダ（インデックスカラー） ---------- */
+function u32be(a, o, v) { a[o] = (v >>> 24) & 255; a[o + 1] = (v >>> 16) & 255; a[o + 2] = (v >>> 8) & 255; a[o + 3] = v & 255; }
+function pngChunk(type, data) {
+  var len = data.length, out = new Uint8Array(len + 12);
+  u32be(out, 0, len);
+  for (var i = 0; i < 4; i++) out[4 + i] = type.charCodeAt(i);
+  out.set(data, 8);
+  u32be(out, 8 + len, crc32(0, out.subarray(4, 8 + len)));
+  return out;
+}
+async function zlib(u8) {
+  var stream = new Blob([u8]).stream().pipeThrough(new CompressionStream('deflate'));
+  return new Uint8Array(await new Response(stream).arrayBuffer());
+}
+var PNG_SIG = new Uint8Array([137, 80, 78, 71, 13, 10, 26, 10]);
+async function encodeIndexed(w, h, idx, Q) {
+  var K = Q.n, order = [], i;
+  for (i = 0; i < K; i++) if (Q.a[i] < 255) order.push(i);   // 透過のある色を先頭に（tRNSを短くする）
+  var nTrans = order.length;
+  for (i = 0; i < K; i++) if (Q.a[i] === 255) order.push(i);
+  var remap = new Uint8Array(256);
+  for (i = 0; i < K; i++) remap[order[i]] = i;
+  var depth = K <= 2 ? 1 : K <= 4 ? 2 : K <= 16 ? 4 : 8;
+  var rowBytes = Math.ceil(w * depth / 8), raw = new Uint8Array((rowBytes + 1) * h), o = 0, p = 0, x;
+  for (var y = 0; y < h; y++) {
+    raw[o++] = 0;  // フィルタなし（パレット画像ではこれが最も小さくなりやすい）
+    if (depth === 8) { for (x = 0; x < w; x++) raw[o + x] = remap[idx[p + x]]; }
+    else { var per = 8 / depth; for (x = 0; x < w; x++) raw[o + ((x / per) | 0)] |= remap[idx[p + x]] << (8 - depth * ((x % per) + 1)); }
+    o += rowBytes; p += w;
+  }
+  var ihdr = new Uint8Array(13); u32be(ihdr, 0, w); u32be(ihdr, 4, h); ihdr[8] = depth; ihdr[9] = 3;
+  var plte = new Uint8Array(K * 3);
+  for (i = 0; i < K; i++) { var s = order[i]; plte[i * 3] = Q.r[s]; plte[i * 3 + 1] = Q.g[s]; plte[i * 3 + 2] = Q.b[s]; }
+  var parts = [PNG_SIG, pngChunk('IHDR', ihdr), pngChunk('PLTE', plte)];
+  if (nTrans) { var tr = new Uint8Array(nTrans); for (i = 0; i < nTrans; i++) tr[i] = Q.a[order[i]]; parts.push(pngChunk('tRNS', tr)); }
+  parts.push(pngChunk('IDAT', await zlib(raw)));
+  parts.push(pngChunk('IEND', new Uint8Array(0)));
+  return new Blob(parts, { type: 'image/png' });
+}
+function exactPalette(data, map) {
+  var u32 = new Uint32Array(data.buffer, data.byteOffset, data.byteLength >> 2), n = u32.length, K = map.size;
+  var Q = { n: K, r: new Uint8Array(K), g: new Uint8Array(K), b: new Uint8Array(K), a: new Uint8Array(K) };
+  map.forEach(function (i, v) { Q.r[i] = v & 255; Q.g[i] = (v >>> 8) & 255; Q.b[i] = (v >>> 16) & 255; Q.a[i] = v >>> 24; });
+  var idx = new Uint8Array(n), prev = -1, pv = 0;
+  for (var p = 0; p < n; p++) { var v = u32[p]; if ((v >>> 24) === 0) v = 0; if (v !== prev) { prev = v; pv = map.get(v); } idx[p] = pv; }
+  return { Q: Q, idx: idx };
+}
+
+/* ---------- 減色（メディアンカット＋k-means） ---------- */
+// 透過のある画像は「乗算済みアルファ」の空間で距離を測る（ほぼ透明な画素が不透明な色に化けるのを防ぐ）
+function buildPoints(data, hasAlpha) {
+  var bins = hasAlpha ? (1 << 18) : (1 << 15);
+  var cnt = new Uint32Array(bins), sr = new Float64Array(bins), sg = new Float64Array(bins), sb = new Float64Array(bins);
+  var sa = hasAlpha ? new Float64Array(bins) : null, transparent = 0, len = data.length, k, i;
+  for (i = 0; i < len; i += 4) {
+    var r = data[i], g = data[i + 1], b = data[i + 2];
+    if (hasAlpha) {
+      var a = data[i + 3];
+      if (a === 0) { transparent++; continue; }
+      k = ((((r >> 3) << 10) | ((g >> 3) << 5) | (b >> 3)) << 3) | (a >> 5);
+      var f = a / 255; sr[k] += r * f; sg[k] += g * f; sb[k] += b * f; sa[k] += a;
+    } else {
+      k = ((r >> 3) << 10) | ((g >> 3) << 5) | (b >> 3);
+      sr[k] += r; sg[k] += g; sb[k] += b;
+    }
+    cnt[k]++;
+  }
+  var m = 0; for (k = 0; k < bins; k++) if (cnt[k]) m++;
+  var P = { n: m, w: new Float64Array(m), r: new Float64Array(m), g: new Float64Array(m), b: new Float64Array(m), a: new Float64Array(m), transparent: transparent };
+  var j = 0;
+  for (k = 0; k < bins; k++) {
+    var c = cnt[k]; if (!c) continue;
+    P.w[j] = c; P.r[j] = sr[k] / c; P.g[j] = sg[k] / c; P.b[j] = sb[k] / c; P.a[j] = hasAlpha ? sa[k] / c : 255; j++;
+  }
+  return P;
+}
+function makeNearest(pal, hasAlpha) {
+  var K = pal.n, ord = [], i;
+  for (i = 0; i < K; i++) ord.push(i);
+  ord.sort(function (x, y) { return pal.g[x] - pal.g[y]; });
+  var G = new Float64Array(K), R = new Float64Array(K), B = new Float64Array(K), A = new Float64Array(K), ID = new Int32Array(K);
+  for (i = 0; i < K; i++) { var s = ord[i]; G[i] = pal.g[s]; R[i] = pal.r[s]; B[i] = pal.b[s]; A[i] = pal.a[s]; ID[i] = s; }
+  return function (r, g, b, a) {
+    var lo = 0, hi = K;
+    while (lo < hi) { var mid = (lo + hi) >> 1; if (G[mid] < g) lo = mid + 1; else hi = mid; }
+    var best = Infinity, bi = ID[Math.min(lo, K - 1)], i1 = lo - 1, j = lo, dg, d, dr, db, da;
+    while (i1 >= 0 || j < K) {
+      if (j < K) {
+        dg = G[j] - g; d = WG * dg * dg;
+        if (d >= best) j = K;
+        else { dr = R[j] - r; db = B[j] - b; d += WR * dr * dr + WB * db * db; if (hasAlpha) { da = A[j] - a; d += WA * da * da; } if (d < best) { best = d; bi = ID[j]; } j++; }
+      }
+      if (i1 >= 0) {
+        dg = G[i1] - g; d = WG * dg * dg;
+        if (d >= best) i1 = -1;
+        else { dr = R[i1] - r; db = B[i1] - b; d += WR * dr * dr + WB * db * db; if (hasAlpha) { da = A[i1] - a; d += WA * da * da; } if (d < best) { best = d; bi = ID[i1]; } i1--; }
+      }
+    }
+    return bi;
+  };
+}
+function medianCut(P, K, hasAlpha) {
+  var n = P.n, ord = new Uint32Array(n), i;
+  for (i = 0; i < n; i++) ord[i] = i;
+  var chans = hasAlpha ? [P.r, P.g, P.b, P.a] : [P.r, P.g, P.b];
+  var cw = hasAlpha ? [WR, WG, WB, WA] : [WR, WG, WB], nc = chans.length;
+  function stats(lo, hi) {
+    var sw = 0, s = [0, 0, 0, 0], q = [0, 0, 0, 0], t, c;
+    for (t = lo; t < hi; t++) { var p = ord[t], w = P.w[p]; sw += w; for (c = 0; c < nc; c++) { var v = chans[c][p]; s[c] += w * v; q[c] += w * v * v; } }
+    var mean = [0, 0, 0, 255], err = 0, axis = 0, bv = -1;
+    for (c = 0; c < nc; c++) {
+      var mu = s[c] / sw, vr = (q[c] / sw - mu * mu) * cw[c]; if (vr < 0) vr = 0;
+      mean[c] = mu; err += vr * sw; if (vr > bv) { bv = vr; axis = c; }
+    }
+    return { lo: lo, hi: hi, sw: sw, mean: mean, err: err, axis: axis };
+  }
+  var boxes = [stats(0, n)];
+  while (boxes.length < K) {
+    var bi = -1, be = 0;
+    for (i = 0; i < boxes.length; i++) { var bx = boxes[i]; if (bx.hi - bx.lo > 1 && bx.err > be) { be = bx.err; bi = i; } }
+    if (bi < 0) break;
+    var Bx = boxes[bi], ch = chans[Bx.axis];
+    ord.subarray(Bx.lo, Bx.hi).sort(function (x, y) { return ch[x] - ch[y]; });
+    var half = Bx.sw / 2, acc = 0, m = Bx.hi - 1;
+    for (var t = Bx.lo; t < Bx.hi - 1; t++) { acc += P.w[ord[t]]; if (acc >= half) { m = t + 1; break; } }
+    if (m <= Bx.lo) m = Bx.lo + 1;
+    boxes[bi] = stats(Bx.lo, m); boxes.push(stats(m, Bx.hi));
+  }
+  var k = boxes.length, pal = { n: k, r: new Float64Array(k), g: new Float64Array(k), b: new Float64Array(k), a: new Float64Array(k) };
+  for (i = 0; i < k; i++) { var mm = boxes[i].mean; pal.r[i] = mm[0]; pal.g[i] = mm[1]; pal.b[i] = mm[2]; pal.a[i] = hasAlpha ? mm[3] : 255; }
+  return pal;
+}
+function refine(P, pal, iters, hasAlpha) {
+  var K = pal.n;
+  for (var it = 0; it < iters; it++) {
+    var near = makeNearest(pal, hasAlpha);
+    var sw = new Float64Array(K), sr = new Float64Array(K), sg = new Float64Array(K), sb = new Float64Array(K), sa = new Float64Array(K);
+    for (var p = 0; p < P.n; p++) {
+      var j = near(P.r[p], P.g[p], P.b[p], P.a[p]), w = P.w[p];
+      sw[j] += w; sr[j] += w * P.r[p]; sg[j] += w * P.g[p]; sb[j] += w * P.b[p]; sa[j] += w * P.a[p];
+    }
+    var moved = 0;
+    for (j = 0; j < K; j++) {
+      if (!sw[j]) continue;
+      var nr = sr[j] / sw[j], ng = sg[j] / sw[j], nb = sb[j] / sw[j], na = hasAlpha ? sa[j] / sw[j] : 255;
+      moved += Math.abs(nr - pal.r[j]) + Math.abs(ng - pal.g[j]) + Math.abs(nb - pal.b[j]) + Math.abs(na - pal.a[j]);
+      pal.r[j] = nr; pal.g[j] = ng; pal.b[j] = nb; pal.a[j] = na;
+    }
+    if (moved < 0.5) break;
+  }
+}
+function clamp8(v) { v = Math.round(v); return v < 0 ? 0 : v > 255 ? 255 : v; }
+function quantize(P, K, hasAlpha) {
+  var reserve = (hasAlpha && P.transparent > 0) ? 1 : 0, Kq = Math.max(1, K - reserve), pal, i;
+  if (P.n <= Kq) pal = { n: P.n, r: Float64Array.from(P.r), g: Float64Array.from(P.g), b: Float64Array.from(P.b), a: Float64Array.from(P.a) };
+  else { pal = medianCut(P, Kq, hasAlpha); refine(P, pal, 6, hasAlpha); }
+  var n = pal.n + reserve;
+  var Q = { n: n, r: new Uint8Array(n), g: new Uint8Array(n), b: new Uint8Array(n), a: new Uint8Array(n),
+            sr: new Float64Array(n), sg: new Float64Array(n), sb: new Float64Array(n), sa: new Float64Array(n), transIdx: -1 };
+  for (i = 0; i < pal.n; i++) {
+    Q.sr[i] = pal.r[i]; Q.sg[i] = pal.g[i]; Q.sb[i] = pal.b[i]; Q.sa[i] = hasAlpha ? pal.a[i] : 255;
+    if (hasAlpha) {
+      var a = Math.max(1, pal.a[i]), f = 255 / a;
+      Q.r[i] = clamp8(pal.r[i] * f); Q.g[i] = clamp8(pal.g[i] * f); Q.b[i] = clamp8(pal.b[i] * f); Q.a[i] = clamp8(a);
+    } else {
+      Q.r[i] = clamp8(pal.r[i]); Q.g[i] = clamp8(pal.g[i]); Q.b[i] = clamp8(pal.b[i]); Q.a[i] = 255;
+    }
+  }
+  if (reserve) Q.transIdx = pal.n;  // 完全な透明は専用の1色
+  return Q;
+}
+function mapPixels(data, Q, hasAlpha, cache) {
+  var n = data.length >> 2, out = new Uint8Array(n);
+  var near = makeNearest({ n: Q.n, r: Q.sr, g: Q.sg, b: Q.sb, a: Q.sa }, hasAlpha);
+  cache.fill(-1, 0, hasAlpha ? (1 << 20) : (1 << 18));
+  var ti = Q.transIdx;
+  for (var p = 0, i = 0; p < n; p++, i += 4) {
+    var r = data[i], g = data[i + 1], b = data[i + 2], key, v;
+    if (hasAlpha) {
+      var a = data[i + 3];
+      if (a === 0 && ti >= 0) { out[p] = ti; continue; }
+      key = ((r >> 3) << 15) | ((g >> 3) << 10) | ((b >> 3) << 5) | (a >> 3);
+      v = cache[key];
+      if (v < 0) {
+        var ca = a === 255 ? 255 : (a >> 3) * 8 + 3.5, f = ca / 255;
+        v = near(((r >> 3) * 8 + 3.5) * f, ((g >> 3) * 8 + 3.5) * f, ((b >> 3) * 8 + 3.5) * f, ca);
+        cache[key] = v;
+      }
+    } else {
+      key = ((r >> 2) << 12) | ((g >> 2) << 6) | (b >> 2);
+      v = cache[key];
+      if (v < 0) { v = near((r >> 2) * 4 + 1.5, (g >> 2) * 4 + 1.5, (b >> 2) * 4 + 1.5, 255); cache[key] = v; }
+    }
+    out[p] = v;
+  }
+  return out;
+}
+
+/* ---------- 画質スコア（SSIM） ---------- */
+function toPlanes(data, n) {
+  var Y = new Float32Array(n), U = new Float32Array(n), V = new Float32Array(n);
+  for (var p = 0, i = 0; p < n; p++, i += 4) {
+    var r = data[i], g = data[i + 1], b = data[i + 2];
+    Y[p] = 0.299 * r + 0.587 * g + 0.114 * b;
+    U[p] = 128 - 0.168736 * r - 0.331264 * g + 0.5 * b;
+    V[p] = 128 + 0.5 * r - 0.418688 * g - 0.081312 * b;
+  }
+  return { Y: Y, U: U, V: V };
+}
+function ssim(A, B, w, h) {
+  var win = Math.min(8, w, h); if (win < 2) return 1;
+  var step = Math.max(1, win >> 1), N = win * win, C1 = 6.5025, C2 = 58.5225;
+  var PA = [A.Y, A.U, A.V], PB = [B.Y, B.U, B.V], res = [1, 1, 1];
+  for (var c = 0; c < 3; c++) {
+    var pa = PA[c], pb = PB[c], sum = 0, cnt = 0;
+    for (var y = 0; y + win <= h; y += step) {
+      for (var x = 0; x + win <= w; x += step) {
+        var sa = 0, sb = 0, saa = 0, sbb = 0, sab = 0;
+        for (var yy = 0; yy < win; yy++) {
+          var o = (y + yy) * w + x;
+          for (var xx = 0; xx < win; xx++) { var a = pa[o + xx], b = pb[o + xx]; sa += a; sb += b; saa += a * a; sbb += b * b; sab += a * b; }
+        }
+        var ma = sa / N, mb = sb / N, va = saa / N - ma * ma, vb = sbb / N - mb * mb, cv = sab / N - ma * mb;
+        sum += ((2 * ma * mb + C1) * (2 * cv + C2)) / ((ma * ma + mb * mb + C1) * (va + vb + C2)); cnt++;
+      }
+    }
+    if (cnt) res[c] = sum / cnt;
+  }
+  return 0.8 * res[0] + 0.1 * res[1] + 0.1 * res[2];
+}
+function buildRef(J) {
+  var aw = J.W, ah = J.H;
+  if (aw * ah > REF_CAP) { var f = Math.sqrt(REF_CAP / (aw * ah)); aw = Math.max(1, Math.round(aw * f)); ah = Math.max(1, Math.round(ah * f)); }
+  var c = scaleCanvas(J.src, J.W, J.H, aw, ah, true);
+  var d = ctx2d(c).getImageData(0, 0, aw, ah).data; freeCanvas(c);
+  var pl = toPlanes(d, aw * ah); pl.w = aw; pl.h = ah; return pl;
+}
+async function scoreBlob(J, blob) {
+  var bmp = await createImageBitmap(blob), R = J.ref;
+  var c = scaleCanvas(bmp, bmp.width, bmp.height, R.w, R.h, true); bmp.close();
+  var d = ctx2d(c).getImageData(0, 0, R.w, R.h).data; freeCanvas(c);
+  return Math.round(ssim(R, toPlanes(d, R.w * R.h), R.w, R.h) * 1000) / 10;
+}
+
+/* ---------- PNG：無加工 → 無劣化 → 減色 → 縮小 ---------- */
+async function searchPng(J, report) {
+  var L = J.lim.png;
+  if (J.kind === 'png' && J.fileSize <= L) return { blob: J.file, size: J.fileSize, w: J.W, h: J.H, scale: 1, mode: 'pass', score: 100 };
+  if (typeof CompressionStream === 'undefined') return { error: 'このブラウザではPNGを圧縮できません' };
+  var known = null;
+  if (J.exact) {
+    await report('PNG：元の' + J.exact.size + '色のまま再圧縮');
+    var ex = exactPalette(J.srcData.data, J.exact);
+    var eb = await encodeIndexed(J.W, J.H, ex.idx, ex.Q);
+    if (eb.size <= L) return { blob: eb, size: eb.size, w: J.W, h: J.H, scale: 1, colors: ex.Q.n, mode: 'lossless', score: 100 };
+    known = eb.size;
+  }
+  await report('PNG：色の分布を解析');
+  var P = buildPoints(J.srcData.data, J.hasAlpha), qc = {};
+  function getQ(K) { return qc[K] || (qc[K] = quantize(P, K, J.hasAlpha)); }
+  async function attempt(s, K) {
+    var d = J.getData(s), Q = getQ(K);
+    var blob = await encodeIndexed(d.w, d.h, mapPixels(d.data, Q, J.hasAlpha, J.cache), Q);
+    return { blob: blob, size: blob.size, w: d.w, h: d.h, scale: s, colors: Q.n, K: K, mode: 'quant' };
+  }
+  var uniq = J.exact ? J.exact.size : Infinity;
+  var Ks = [256, 128, 64, 32, 16, 8].filter(function (k) { return k >= J.set.pngMinColors && k < uniq; });
+  var A = null, t, b;
+  // (c) 原寸のまま色数を減らす
+  if (Ks.length) {
+    await report('PNG：' + Ks[0] + '色に減色して試算');
+    var r0 = await attempt(1, Ks[0]);
+    if (Ks[0] === 256) known = r0.size;
+    if (r0.size <= L) A = r0;
+    else if (Ks.length > 1) {
+      // 色数を最少まで減らしても届かないほど大きければ、減色の試算は省く
+      var ratio = Math.log2(Ks[Ks.length - 1]) / Math.log2(Ks[0]);
+      if (r0.size * ratio * 0.6 <= L) {
+        var overK = Ks[0];
+        for (t = 1; t < Ks.length && !A; t++) {
+          await report('PNG：' + Ks[t] + '色に減色して試算');
+          var rt = await attempt(1, Ks[t]);
+          if (rt.size <= L) A = rt; else overK = Ks[t];
+        }
+        if (A) {  // 収まった色数と収まらなかった色数の間を詰める
+          var lo = A.K, hi = overK;
+          for (b = 0; b < 3 && hi - lo > 8; b++) {
+            var mid = Math.round((lo + hi) / 2);
+            await report('PNG：' + mid + '色に減色して試算');
+            var rm = await attempt(1, mid);
+            if (rm.size <= L) { A = rm; lo = mid; } else hi = mid;
+          }
+        }
+      }
+    }
+  }
+  // (d) 色数を保ったまま縮小（原寸で最大色数に収まったなら不要）
+  var B = null;
+  if (!(A && A.K === Ks[0])) {
+    var s = known ? Math.min(0.97, Math.sqrt(L / known) * 0.95) : 0.85, hiS = 1, fit = null;
+    for (var g = 0; g < 14; g++) {
+      var dd = dimsAt(J.W, J.H, s);
+      if (Math.max(dd.w, dd.h) < 16) break;
+      await report('PNG：' + pct(s) + 'に縮小して試算');
+      var r = await attempt(s, 256);
+      if (r.size <= L) { fit = r; break; }
+      hiS = s;
+      s = Math.max(s * 0.5, Math.min(s * 0.95, s * Math.sqrt(L / r.size) * 0.95));
+    }
+    if (fit) {
+      var loS = fit.scale;
+      for (b = 0; b < 3 && hiS / loS > 1.03; b++) {
+        var ms = (loS + hiS) / 2;
+        await report('PNG：' + pct(ms) + 'に縮小して試算');
+        var rr = await attempt(ms, 256);
+        if (rr.size <= L) { fit = rr; loS = ms; } else hiS = ms;
+      }
+      B = fit;
+    }
+  }
+  var cands = [A, B].filter(Boolean);
+  if (!cands.length) return { error: 'PNGでは上限に収まりませんでした' };
+  for (t = 0; t < cands.length; t++) { await report('PNG：画質を評価'); cands[t].score = await J.score(cands[t].blob); }
+  cands.sort(function (x, y) { return y.score - x.score; });
+  if (cands.length > 1) cands[0].alt = { w: cands[1].w, h: cands[1].h, colors: cands[1].colors, score: cands[1].score };
+  return cands[0];
+}
+
+/* ---------- JPEG：品質の二分探索（最低品質で超えるなら縮小） ---------- */
+async function searchJpeg(J, report) {
+  var L = J.lim.jpg;
+  if (J.kind === 'jpeg' && J.fileSize <= L) return { blob: J.file, size: J.fileSize, w: J.W, h: J.H, scale: 1, mode: 'pass', score: 100 };
+  var qMin = Math.max(1, Math.min(100, J.set.jpegMinQ | 0));
+  function enc(c, q) { return toBlob(c, 'image/jpeg', q / 100); }
+  function drop(c) { if (c && c !== J.src) freeCanvas(c); }
+  var s = 1, hiS = 0, c = J.whiteCanvas(1);
+  await report('JPEG：品質' + qMin + 'で試算');
+  var blob = await enc(c, qMin);
+  for (var g = 0; blob.size > L; g++) {
+    hiS = s;
+    s = Math.max(s * 0.5, Math.min(s * 0.95, s * Math.sqrt(L / blob.size) * 0.97));
+    var d = dimsAt(J.W, J.H, s);
+    if (g >= 14 || Math.max(d.w, d.h) < 16) { drop(c); return { error: 'JPEGでは上限に収まりませんでした' }; }
+    drop(c); c = J.whiteCanvas(s);
+    await report('JPEG：' + pct(s) + 'に縮小して試算');
+    blob = await enc(c, qMin);
+  }
+  if (hiS) {
+    var loS = s;
+    for (var b = 0; b < 3 && hiS / loS > 1.02; b++) {
+      var ms = (loS + hiS) / 2, cm = J.whiteCanvas(ms);
+      await report('JPEG：' + pct(ms) + 'に縮小して試算');
+      var bm = await enc(cm, qMin);
+      if (bm.size <= L) { drop(c); c = cm; blob = bm; loS = ms; } else { drop(cm); hiS = ms; }
+    }
+    s = loS;
+  }
+  var best = blob, bestQ = qMin, lo = qMin, hi = 101;
+  await report('JPEG：上限に合わせて品質を探索');
+  while (hi - lo > 1) {
+    var mid = (lo + hi) >> 1, bq = await enc(c, mid);
+    if (bq.size <= L) { lo = mid; best = bq; bestQ = mid; } else hi = mid;
+  }
+  var dd = dimsAt(J.W, J.H, s); drop(c);
+  return { blob: best, size: best.size, w: dd.w, h: dd.h, scale: s, quality: bestQ, mode: 'jpeg' };
+}
+
+/* ---------- 推奨形式の決定 ---------- */
+function decide(J, png, jpg) {
+  var okP = png && !png.error, okJ = jpg && !jpg.error;
+  if (!okP && !okJ) return { rec: null, reason: '' };
+  if (!okJ) return { rec: 'png', reason: 'JPEGを作れなかったため' };
+  if (!okP) return { rec: 'jpeg', reason: 'PNGでは上限に収められなかったため' };
+  if (J.hasAlpha) return { rec: 'png', reason: '透過があるためPNG（JPEGにすると透過部分が白になります）' };
+  var d = png.score - jpg.score;
+  if (Math.abs(d) >= 0.3) return { rec: d > 0 ? 'png' : 'jpeg', reason: '画質スコアが高い方（PNG ' + png.score.toFixed(1) + ' ／ JPEG ' + jpg.score.toFixed(1) + '）' };
+  var ap = png.w * png.h, aj = jpg.w * jpg.h;
+  if (ap !== aj) return { rec: ap > aj ? 'png' : 'jpeg', reason: '画質スコアがほぼ同じなので、解像度が高い方' };
+  var flat = J.flat >= 0.5;
+  return { rec: flat ? 'png' : 'jpeg', reason: '画質スコア・解像度が同等なので、絵柄（' + (flat ? '平坦な色が多い' : '写真・グラデーション調') + '）から判断' };
+}
+
+/* ---------- 1件の処理 ---------- */
+async function processJob(job, report) {
+  var file = job.file, set = job.settings;
+  var head = new Uint8Array(await file.slice(0, 16).arrayBuffer());
+  var kind = sniff(head);
+  await report('画像を読み込み中');
+  var bmp;
+  try { bmp = await createImageBitmap(file); }
+  catch (e) { throw new Error('画像として読み込めませんでした（対応していない形式の可能性があります）'); }
+  var W = bmp.width, H = bmp.height, pre = false;
+  if (W * H > MAX_PIXELS) {
+    var f = Math.sqrt(MAX_PIXELS / (W * H));
+    var nb = await createImageBitmap(bmp, { resizeWidth: Math.round(W * f), resizeHeight: Math.round(H * f), resizeQuality: 'high' });
+    bmp.close(); bmp = nb; W = bmp.width; H = bmp.height; pre = true;
+  }
+  var src = makeCanvas(W, H), gs = ctx2d(src);
+  gs.drawImage(bmp, 0, 0); bmp.close();
+  var srcData = gs.getImageData(0, 0, W, H);
+  await report('画像の特徴を解析');
+  var an = analyze(srcData.data, W, H);
+  if (!CACHE) CACHE = new Int16Array(1 << 20);
+  var J = { file: file, fileSize: file.size, kind: kind, W: W, H: H, src: src, srcData: srcData, hasAlpha: an.hasAlpha,
+            flat: an.flat, exact: an.exact, set: set, lim: { png: set.pngLimit, jpg: set.jpgLimit }, cache: CACHE };
+  J.getData = function (s) {
+    if (s >= 1) return { w: W, h: H, data: srcData.data };
+    var d = dimsAt(W, H, s), c = scaleCanvas(src, W, H, d.w, d.h, false);
+    var id = ctx2d(c).getImageData(0, 0, d.w, d.h); freeCanvas(c);
+    return { w: d.w, h: d.h, data: id.data };
+  };
+  J.whiteCanvas = function (s) {
+    if (s >= 1 && !J.hasAlpha) return src;
+    var d = dimsAt(W, H, Math.min(1, s));
+    return scaleCanvas(src, W, H, d.w, d.h, true);
+  };
+  J.ref = buildRef(J);
+  J.score = function (blob) { return scoreBlob(J, blob); };
+
+  var tf = Math.min(1, 160 / Math.max(W, H)), td = dimsAt(W, H, tf);
+  var tc = scaleCanvas(src, W, H, td.w, td.h, true), thumb = await toBlob(tc, 'image/jpeg', 0.82); freeCanvas(tc);
+
+  var png, jpg;
+  try { png = await searchPng(J, report); } catch (e) { png = { error: 'PNGの処理でエラー：' + (e && e.message || e) }; }
+  try { jpg = await searchJpeg(J, report); } catch (e) { jpg = { error: 'JPEGの処理でエラー：' + (e && e.message || e) }; }
+  if (jpg && !jpg.error && jpg.score == null) { await report('JPEG：画質を評価'); jpg.score = await J.score(jpg.blob); }
+  var cs = [png, jpg];
+  for (var i = 0; i < cs.length; i++) if (cs[i] && !cs[i].error) cs[i].crc = crc32(0, new Uint8Array(await cs[i].blob.arrayBuffer()));
+  var dec = decide(J, png, jpg);
+  freeCanvas(src); J.srcData = null; J.ref = null;
+  return { W: W, H: H, kind: kind, fileSize: file.size, hasAlpha: an.hasAlpha, flat: an.flat, uniq: an.exact ? an.exact.size : null,
+           pre: pre, thumb: thumb, png: png, jpg: jpg, rec: dec.rec, reason: dec.reason };
+}
+
+if (typeof WorkerGlobalScope !== 'undefined' && self instanceof WorkerGlobalScope) {
+  self.onmessage = function (e) {
+    var job = e.data;
+    processJob(job, function (stage) { self.postMessage({ type: 'progress', id: job.id, stage: stage }); })
+      .then(function (res) { self.postMessage({ type: 'done', id: job.id, result: res }); })
+      .catch(function (err) { self.postMessage({ type: 'error', id: job.id, message: (err && err.message) || String(err) }); });
+  };
+}
+</script>
+
+<!-- ======================= 画面側 ======================= -->
+<script>
+(function () {
+'use strict';
+var $ = function (s, r) { return (r || document).querySelector(s); };
+var $$ = function (s, r) { return Array.prototype.slice.call((r || document).querySelectorAll(s)); };
+var ENGINE = document.getElementById('engine-src').textContent;
+var DEFAULTS = { jpgKB: 300, pngKB: 120, unit: 1000, jpegMinQ: 70, pngMinColors: 32 };
+var SCORE_WARN = 90;
+var STORE_KEY = 'image-compressor.settings.v1';
+
+var settings = loadSettings();
+var items = [], keys = new Set(), nextId = 1, jobSeq = 0, jobs = new Map();
+var pool = null, filter = 'all', runStart = 0, runTotal = 0, runDoneBase = 0, dirty = false;
+
+/* ---------- helpers ---------- */
+function esc(s) { return String(s).replace(/[&<>"']/g, function (c) { return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]; }); }
+function fmtKB(n) { var u = settings.unit, kb = n / u; if (kb < 1000) return kb.toFixed(1) + ' KB'; return (n / (u * u)).toFixed(2) + ' MB'; }
+function fmtBig(n) { var u = settings.unit; return n >= u * u ? (n / (u * u)).toFixed(1) + ' MB' : (n / u).toFixed(0) + ' KB'; }
+function pct(v) { return Math.round(v * 100) + '%'; }
+function fmtDur(ms) { var s = Math.round(ms / 1000); if (s < 60) return s + '秒'; return Math.floor(s / 60) + '分' + (s % 60 ? (s % 60) + '秒' : ''); }
+function baseName(n) { return n.replace(/\.[^.]+$/, ''); }
+function limits() { return { jpg: Math.floor(settings.jpgKB * settings.unit), png: Math.floor(settings.pngKB * settings.unit) }; }
+function cand(it, fmt) { var r = it.result; if (!r) return null; var c = fmt === 'png' ? r.png : r.jpg; return c && !c.error ? c : null; }
+function sleep(ms) { return new Promise(function (r) { setTimeout(r, ms); }); }
+var toastTimer = 0;
+function toast(msg, ms) {
+  var t = $('#toast'); t.textContent = msg; t.classList.add('show');
+  clearTimeout(toastTimer); toastTimer = setTimeout(function () { t.classList.remove('show'); }, ms || 3200);
+}
+
+/* ---------- settings ---------- */
+function loadSettings() {
+  try { var s = JSON.parse(localStorage.getItem(STORE_KEY) || 'null'); if (s) return Object.assign({}, DEFAULTS, s); } catch (e) {}
+  return Object.assign({}, DEFAULTS);
+}
+function saveSettings() { try { localStorage.setItem(STORE_KEY, JSON.stringify(settings)); } catch (e) {} }
+function settingsToForm() {
+  $('#sJpg').value = settings.jpgKB; $('#sPng').value = settings.pngKB; $('#sQ').value = settings.jpegMinQ; $('#sK').value = String(settings.pngMinColors);
+  $$('input[name=sUnit]').forEach(function (r) { r.checked = Number(r.value) === settings.unit; });
+  renderLimitText();
+}
+function renderLimitText() {
+  var u = settings.unit === 1024 ? '1KB=1024バイト' : '1KB=1000バイト';
+  $('#limitChips').innerHTML = '<span class="limit-chip">JPEG <b>' + settings.jpgKB + 'KB</b> 以下</span><span class="limit-chip">PNG <b>' + settings.pngKB + 'KB</b> 以下</span><span class="limit-chip">' + u + '</span>';
+  $('#settingsSum').textContent = 'JPEG ' + settings.jpgKB + 'KB ／ PNG ' + settings.pngKB + 'KB ／ 最低品質 ' + settings.jpegMinQ + ' ／ 最少 ' + settings.pngMinColors + '色';
+}
+function readForm() {
+  function num(id, lo, hi, def) { var v = Math.round(Number($(id).value)); return isFinite(v) && v >= lo && v <= hi ? v : def; }
+  var u = $$('input[name=sUnit]').filter(function (r) { return r.checked; })[0];
+  return {
+    jpgKB: num('#sJpg', 10, 10000, DEFAULTS.jpgKB), pngKB: num('#sPng', 10, 10000, DEFAULTS.pngKB),
+    unit: u ? Number(u.value) : 1000, jpegMinQ: num('#sQ', 30, 95, DEFAULTS.jpegMinQ), pngMinColors: Number($('#sK').value) || 32
+  };
+}
+function onSettingsChange(next) {
+  var s = next && next.jpgKB ? next : readForm(), changed = JSON.stringify(s) !== JSON.stringify(settings);
+  if (!changed) return;
+  settings = s; saveSettings(); renderLimitText();
+  if (items.length) { dirty = true; $('#sApply').hidden = false; $('#dirtyNote').hidden = false; }
+  items.forEach(function (it) { if (it.status === 'done') renderRow(it); });
+  updateSummary();
+}
+['#sJpg', '#sPng', '#sQ', '#sK'].forEach(function (id) { $(id).addEventListener('change', onSettingsChange); });
+$$('input[name=sUnit]').forEach(function (r) { r.addEventListener('change', onSettingsChange); });
+$('#sReset').addEventListener('click', function () { onSettingsChange(Object.assign({}, DEFAULTS)); settingsToForm(); });
+$('#sApply').addEventListener('click', reprocessAll);
+
+/* ---------- capability check ---------- */
+(function () {
+  var miss = [];
+  if (!window.createImageBitmap) miss.push('画像の読み込み（createImageBitmap）');
+  if (!window.CompressionStream) miss.push('PNGの圧縮（CompressionStream）');
+  if (miss.length) {
+    var n = $('#capNotice'); n.hidden = false;
+    n.textContent = 'このブラウザでは次の機能が使えません：' + miss.join('、') + '。Microsoft Edge または Google Chrome の最新版で開いてください。';
+  }
+  if (window.showDirectoryPicker) $('#saveDir').hidden = false;
+})();
+
+/* ---------- intake ---------- */
+function isImage(f) { return /^image\//.test(f.type) || /\.(png|jpe?g|webp|gif|bmp|avif)$/i.test(f.name); }
+function addFiles(list) {
+  var files = list.filter(isImage), skipped = list.length - files.length, added = 0, dup = 0;
+  files.sort(function (a, b) { return a.name.localeCompare(b.name, 'ja', { numeric: true }); });
+  files.forEach(function (f) {
+    var key = f.name + '|' + f.size + '|' + f.lastModified;
+    if (keys.has(key)) { dup++; return; }
+    keys.add(key);
+    var it = { id: nextId++, key: key, file: f, name: f.name, base: baseName(f.name), status: 'queued', stage: '', result: null, choice: null, thumbUrl: null, outName: '', renamed: false, el: null, error: '' };
+    items.push(it); added++;
+    it.el = document.createElement('div'); it.el.className = 'row'; it.el.setAttribute('role', 'listitem'); it.el.dataset.id = it.id;
+    $('#list').appendChild(it.el); renderRow(it);
+  });
+  var msg = [];
+  if (added) msg.push(added + '件を追加しました');
+  if (dup) msg.push(dup + '件は追加済みのため省きました');
+  if (skipped) msg.push(skipped + '件は画像ではないため省きました');
+  if (msg.length) toast(msg.join('。'));
+  if (!added) return;
+  $('#results').hidden = false;
+  startRun();
+}
+function startRun() {
+  var pending = items.filter(function (it) { return it.status === 'queued' || it.status === 'processing'; }).length;
+  if (!runStart || !isRunning()) { runStart = performance.now(); runDoneBase = items.filter(function (it) { return it.status === 'done' || it.status === 'error'; }).length; }
+  runTotal = pending;
+  pump(); updateProgress(); updateSummary();
+}
+function isRunning() { return items.some(function (it) { return it.status === 'queued' || it.status === 'processing'; }); }
+
+var drop = $('#drop');
+$('#pickFiles').addEventListener('click', function (e) { e.stopPropagation(); $('#fileInput').click(); });
+$('#pickDir').addEventListener('click', function (e) { e.stopPropagation(); $('#dirInput').click(); });
+drop.addEventListener('click', function (e) { if (e.target === drop || e.target.closest('svg,strong,.sub')) $('#fileInput').click(); });
+drop.addEventListener('keydown', function (e) { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); $('#fileInput').click(); } });
+$('#fileInput').addEventListener('change', function (e) { addFiles(Array.prototype.slice.call(e.target.files)); e.target.value = ''; });
+$('#dirInput').addEventListener('change', function (e) { addFiles(Array.prototype.slice.call(e.target.files)); e.target.value = ''; });
+var dragDepth = 0;
+document.addEventListener('dragenter', function (e) { if (hasFiles(e)) { dragDepth++; drop.classList.add('over'); } });
+document.addEventListener('dragleave', function () { if (--dragDepth <= 0) { dragDepth = 0; drop.classList.remove('over'); } });
+document.addEventListener('dragover', function (e) { if (hasFiles(e)) { e.preventDefault(); e.dataTransfer.dropEffect = 'copy'; } });
+document.addEventListener('drop', function (e) {
+  if (!hasFiles(e)) return;
+  e.preventDefault(); dragDepth = 0; drop.classList.remove('over');
+  collectDropped(e.dataTransfer).then(addFiles);
+});
+function hasFiles(e) { return e.dataTransfer && Array.prototype.indexOf.call(e.dataTransfer.types || [], 'Files') >= 0; }
+function collectDropped(dt) {
+  var entries = [];
+  if (dt.items) for (var i = 0; i < dt.items.length; i++) { var en = dt.items[i].webkitGetAsEntry && dt.items[i].webkitGetAsEntry(); if (en) entries.push(en); }
+  if (!entries.length) return Promise.resolve(Array.prototype.slice.call(dt.files || []));
+  var out = [];
+  function walk(en) {
+    if (en.isFile) return new Promise(function (res) { en.file(function (f) { out.push(f); res(); }, function () { res(); }); });
+    if (en.isDirectory) {
+      var reader = en.createReader();
+      return new Promise(function (res) {
+        var all = [];
+        (function read() {
+          reader.readEntries(function (batch) {
+            if (!batch.length) { Promise.all(all.map(walk)).then(res); return; }
+            all = all.concat(Array.prototype.slice.call(batch)); read();
+          }, function () { Promise.all(all.map(walk)).then(res); });
+        })();
+      });
+    }
+    return Promise.resolve();
+  }
+  return Promise.all(entries.map(walk)).then(function () { return out; });
+}
+
+/* ---------- worker pool ---------- */
+function jobSettings() { var l = limits(); return { jpgLimit: l.jpg, pngLimit: l.png, jpegMinQ: settings.jpegMinQ, pngMinColors: settings.pngMinColors }; }
+function createPool() {
+  var n = Math.max(1, Math.min(3, (navigator.hardwareConcurrency || 2) - 1)), workers = [], url = null;
+  try {
+    url = URL.createObjectURL(new Blob([ENGINE], { type: 'text/javascript' }));
+    for (var i = 0; i < n; i++) {
+      var w = new Worker(url);
+      w.busy = null; w.dead = false;
+      w.onmessage = onWorkerMsg.bind(null, w);
+      w.onerror = onWorkerErr.bind(null, w);
+      workers.push(w);
+    }
+  } catch (e) {
+    workers.forEach(function (w) { w.terminate(); }); workers = [];
+    if (url) URL.revokeObjectURL(url);
+  }
+  if (!workers.length) return mainPool();
+  return { mode: 'worker', workers: workers, url: url };
+}
+function mainPool() {
+  var fn = new Function(ENGINE + '\n;return processJob;')();
+  return { mode: 'main', fn: fn, busy: null };
+}
+function destroyPool() {
+  if (!pool) return;
+  if (pool.mode === 'worker') { pool.workers.forEach(function (w) { w.terminate(); }); if (pool.url) URL.revokeObjectURL(pool.url); }
+  pool = null; jobs.clear();
+}
+function nextQueued() { for (var i = 0; i < items.length; i++) if (items[i].status === 'queued') return items[i]; return null; }
+function pump() {
+  if (!pool) pool = createPool();
+  if (pool.mode === 'worker') {
+    var live = pool.workers.filter(function (w) { return !w.dead; });
+    if (!live.length) { destroyPool(); pool = mainPool(); return pump(); }
+    live.forEach(function (w) {
+      if (w.busy) return;
+      var it = nextQueued(); if (!it) return;
+      var id = ++jobSeq; jobs.set(id, it); w.busy = id;
+      it.status = 'processing'; it.stage = '開始'; renderRow(it);
+      w.postMessage({ id: id, file: it.file, settings: jobSettings() });
+    });
+  } else if (!pool.busy) {
+    var it = nextQueued(); if (!it) return;
+    var id = ++jobSeq, p = pool; jobs.set(id, it); p.busy = id;
+    it.status = 'processing'; it.stage = '開始'; renderRow(it);
+    p.fn({ id: id, file: it.file, settings: jobSettings() }, function (stage) { it.stage = stage; scheduleProgress(); return sleep(0); })
+      .then(function (res) { handleMsg({ type: 'done', id: id, result: res }); }, function (err) { handleMsg({ type: 'error', id: id, message: err && err.message || String(err) }); })
+      .then(function () { if (pool === p) { p.busy = null; pump(); } });
+  }
+  scheduleProgress();
+}
+function onWorkerMsg(w, e) {
+  var m = e.data;
+  if (m.type === 'progress') { var it = jobs.get(m.id); if (it) { it.stage = m.stage; scheduleProgress(); } return; }
+  if (w.busy === m.id) w.busy = null;
+  handleMsg(m);
+  pump();
+}
+function onWorkerErr(w, e) {
+  e.preventDefault && e.preventDefault();
+  w.dead = true;
+  if (w.busy) { var it = jobs.get(w.busy); jobs.delete(w.busy); w.busy = null; if (it) { it.status = 'queued'; renderRow(it); } }
+  pump();
+}
+function handleMsg(m) {
+  var it = jobs.get(m.id); if (!it) return;
+  jobs.delete(m.id);
+  if (m.type === 'done') {
+    var r = m.result;
+    it.result = r;
+    if (it.thumbUrl) URL.revokeObjectURL(it.thumbUrl);
+    it.thumbUrl = r.thumb ? URL.createObjectURL(r.thumb) : null;
+    r.thumb = null;
+    if (!r.rec) { it.status = 'error'; it.error = (r.png && r.png.error) || (r.jpg && r.jpg.error) || '変換できませんでした'; }
+    else { it.status = 'done'; it.choice = r.rec; it.limitsUsed = limits(); }
+  } else {
+    it.status = 'error'; it.error = m.message || '処理に失敗しました';
+  }
+  renameAll(); renderRow(it); updateSummary(); scheduleProgress();
+  if (!isRunning()) onRunEnd();
+}
+function onRunEnd() {
+  var n = items.filter(function (it) { return it.status === 'done'; }).length;
+  var err = items.filter(function (it) { return it.status === 'error'; }).length;
+  toast('処理が終わりました（' + n + '件' + (err ? '、エラー ' + err + '件' : '') + '）');
+}
+
+/* ---------- progress ---------- */
+var progQueued = false;
+function scheduleProgress() { if (progQueued) return; progQueued = true; requestAnimationFrame(function () { progQueued = false; updateProgress(); }); }
+function updateProgress() {
+  var sec = $('#progress'), running = isRunning();
+  if (!items.length) { sec.hidden = true; return; }
+  sec.hidden = false;
+  var finished = items.filter(function (it) { return it.status === 'done' || it.status === 'error'; }).length;
+  var total = items.length, pctv = total ? finished / total : 0;
+  $('#progCount').textContent = finished + ' / ' + total + ' 件';
+  $('#progLabel').textContent = running ? '処理中' : '完了';
+  $('#progBar').style.width = (pctv * 100).toFixed(1) + '%';
+  $('#progBarWrap').setAttribute('aria-valuenow', Math.round(pctv * 100));
+  var el = performance.now() - runStart, doneRun = finished - runDoneBase, remain = total - finished, tx = '';
+  if (running && runStart) {
+    tx = '経過 ' + fmtDur(el);
+    if (doneRun >= 2 && remain > 0) tx += ' ・ 残り約 ' + fmtDur(el / doneRun * remain);
+  }
+  $('#progTime').textContent = tx;
+  var now = items.filter(function (it) { return it.status === 'processing'; });
+  $('#progNow').innerHTML = now.map(function (it) {
+    return '<li><i class="spin" aria-hidden="true"></i><b>' + esc(it.name) + '</b><span>' + esc(it.stage || '') + '</span></li>';
+  }).join('');
+  now.forEach(function (it) { var st = it.el && it.el.querySelector('.stage-text'); if (st) st.textContent = it.stage || '処理中'; });
+}
+
+/* ---------- naming ---------- */
+function renameAll() {
+  var used = new Set();
+  items.forEach(function (it) {
+    var prev = it.outName;
+    if (it.status !== 'done' || !cand(it, it.choice)) { it.outName = ''; it.renamed = false; }
+    else {
+      var ext = it.choice === 'png' ? '.png' : '.jpg', name = it.base + ext, n = 2;
+      while (used.has(name.toLowerCase())) { name = it.base + '_' + n + ext; n++; }
+      used.add(name.toLowerCase());
+      it.outName = name; it.renamed = name !== it.base + ext;
+    }
+    if (prev && prev !== it.outName && it.status === 'done') renderRow(it);
+  });
+}
+
+/* ---------- rows ---------- */
+function flags(it) {
+  var r = it.result, c = cand(it, it.choice), f = [];
+  if (!c) return f;
+  if (it.choice === 'jpeg' && r.hasAlpha) f.push({ t: '透過→白背景', k: 'warn', attn: true, tip: '透過部分は白で塗りつぶされます' });
+  if (c.mode === 'pass') f.push({ t: '無加工', k: 'ok', tip: '元のファイルがそのまま上限内のため、変換していません' });
+  else if (c.mode === 'lossless') f.push({ t: '無劣化', k: 'ok', tip: '元の色数が256色以下なので、色を変えずにパレットPNGへ作り直しました' });
+  var sc = c.w / r.W;
+  if (sc < 0.999) f.push({ t: '縮小 ' + pct(sc), k: sc < 0.8 ? 'warn' : '', attn: sc < 0.8, tip: '解像度を縦横とも ' + pct(sc) + ' に縮小しています' });
+  if (c.score < SCORE_WARN) f.push({ t: '画質 ' + c.score.toFixed(1), k: 'warn', attn: true, tip: '元画像との差が大きめです。比較で確認してください' });
+  var lim = limits(), L = it.choice === 'png' ? lim.png : lim.jpg;
+  if (c.size > L) f.push({ t: '上限超過', k: 'err', attn: true, tip: '今の設定の上限を超えています。再処理してください' });
+  if (r.pre) f.push({ t: '読込時に縮小', k: '', tip: '非常に大きい画像だったため、読み込み時に縮小しました' });
+  if (!/^\d{8}$/.test(it.base)) f.push({ t: '8桁以外の名前', k: '', tip: 'ファイル名が8桁の数字ではありません（名前はそのまま使います）' });
+  if (it.renamed) f.push({ t: '連番付与', k: '', tip: '同じ名前の出力があるため番号を付けました' });
+  return f;
+}
+function isAttn(it) { return it.status === 'error' || (it.status === 'done' && flags(it).some(function (f) { return f.attn; })); }
+function isShrunk(it) { var c = cand(it, it.choice); return it.status === 'done' && c && c.w < it.result.W; }
+function optHTML(it, fmt) {
+  var r = it.result, c = cand(it, fmt), raw = fmt === 'png' ? r.png : r.jpg, label = fmt === 'png' ? 'PNG' : 'JPEG';
+  var sel = it.choice === fmt, rec = r.rec === fmt;
+  if (!c) {
+    return '<button type="button" class="opt" disabled aria-pressed="false"><span class="o-top"><b>' + label + '</b></span><span class="o-err">' + esc(raw && raw.error || '作成できません') + '</span></button>';
+  }
+  var lim = limits(), L = fmt === 'png' ? lim.png : lim.jpg, ratio = Math.min(1, c.size / L);
+  var sub = [];
+  if (c.mode === 'pass') sub.push('無加工');
+  else if (fmt === 'png') sub.push(c.colors + '色' + (c.mode === 'lossless' ? '（元のまま）' : ''));
+  else sub.push('品質 ' + c.quality);
+  sub.push(c.w < r.W ? '縮小 ' + pct(c.w / r.W) : '原寸');
+  if (fmt === 'jpeg' && r.hasAlpha) sub.push('透過→白');
+  var tip = label + '：' + c.size.toLocaleString() + 'バイト（上限の ' + Math.round(c.size / L * 100) + '%）、' + c.w + '×' + c.h;
+  if (rec && r.reason) tip += '\n推奨の理由：' + r.reason;
+  return '<button type="button" class="opt" data-act="pick" data-fmt="' + fmt + '" aria-pressed="' + sel + '" title="' + esc(tip) + '">' +
+    '<span class="o-top"><b>' + label + '</b>' + (rec ? '<span class="tag">推奨</span>' : '') +
+    '<span class="o-score' + (c.score < SCORE_WARN ? ' low' : '') + '" title="画質スコア（100が劣化なし）">画質 ' + c.score.toFixed(1) + '</span></span>' +
+    '<span class="o-size">' + fmtKB(c.size) + '</span>' +
+    '<span class="o-sub">' + esc(sub.join(' ・ ')) + '</span>' +
+    '<span class="meter" aria-hidden="true"><i style="width:' + (ratio * 100).toFixed(1) + '%"></i></span></button>';
+}
+function renderRow(it) {
+  var el = it.el; if (!el) return;
+  var thumb = '<div class="c-thumb"><div class="thumb">' + (it.thumbUrl ? '<img src="' + it.thumbUrl + '" alt="">' : '') + '</div></div>';
+  var srcMeta = '';
+  if (it.result) {
+    var r = it.result, kind = r.kind === 'png' ? 'PNG' : r.kind === 'jpeg' ? 'JPEG' : '画像';
+    srcMeta = r.W + '×' + r.H + ' ・ ' + fmtKB(r.fileSize) + ' ・ ' + kind + ' ・ ' + (r.flat >= 0.5 ? '図版・スクショ調' : '写真・イラスト調') + (r.hasAlpha ? ' ・ 透過あり' : '');
+  } else srcMeta = fmtKB(it.file.size);
+  var src = '<div class="c-src"><div class="fname" title="' + esc(it.name) + '">' + esc(it.name) + '</div><div class="meta num">' + esc(srcMeta) + '</div></div>';
+  var html;
+  if (it.status === 'queued' || it.status === 'processing') {
+    var st = it.status === 'queued' ? '<div class="state">待機中</div>' : '<div class="state"><i class="spin" aria-hidden="true"></i><span class="stage-text">' + esc(it.stage || '処理中') + '</span></div>';
+    html = thumb + src + '<div class="c-choose">' + st + '</div><div class="c-out"></div><div class="c-acts"></div>';
+  } else if (it.status === 'error') {
+    html = thumb + src + '<div class="c-choose"><div class="state err">' + esc(it.error) + '</div></div><div class="c-out"></div>' +
+      '<div class="c-acts acts"><button type="button" class="btn small ghost" data-act="del">一覧から外す</button></div>';
+  } else {
+    var c = cand(it, it.choice), r2 = it.result;
+    var badges = flags(it).map(function (f) { return '<span class="badge ' + f.k + '" title="' + esc(f.tip || '') + '">' + esc(f.t) + '</span>'; }).join('');
+    var outMeta = c.w + '×' + c.h + ' ・ 容量 ' + Math.max(0.1, Math.round(c.size / r2.fileSize * 1000) / 10) + '%';
+    html = thumb + src +
+      '<div class="c-choose"><div class="choose" role="group" aria-label="出力形式">' + optHTML(it, 'png') + optHTML(it, 'jpeg') + '</div></div>' +
+      '<div class="c-out"><div class="oname" title="' + esc(it.outName) + '">' + esc(it.outName) + '</div><div class="meta num">' + esc(outMeta) + '</div><div class="badges">' + badges + '</div></div>' +
+      '<div class="c-acts acts"><button type="button" class="btn small" data-act="cmp">比較</button><button type="button" class="btn small" data-act="dl" title="この1件を保存">保存</button></div>';
+  }
+  el.innerHTML = html;
+  applyFilter(it);
+}
+function applyFilter(it) {
+  var show = filter === 'all' || (filter === 'attn' && isAttn(it)) || (filter === 'shrink' && isShrunk(it)) || (filter === 'err' && it.status === 'error');
+  it.el.classList.toggle('hide', !show);
+}
+$('#list').addEventListener('click', function (e) {
+  var b = e.target.closest('[data-act]'); if (!b) return;
+  var row = b.closest('.row'), it = items.find(function (x) { return String(x.id) === row.dataset.id; }); if (!it) return;
+  var act = b.dataset.act;
+  if (act === 'pick') { setChoice(it, b.dataset.fmt); }
+  else if (act === 'cmp') openCmp(it);
+  else if (act === 'dl') { var c = cand(it, it.choice); if (c) saveBlob(c.blob, it.outName); }
+  else if (act === 'del') removeItem(it);
+});
+function setChoice(it, fmt) {
+  if (!cand(it, fmt) || it.choice === fmt) return;
+  it.choice = fmt; renameAll(); renderRow(it); updateSummary();
+}
+function removeItem(it) {
+  if (it.status === 'processing') return;
+  if (it.thumbUrl) URL.revokeObjectURL(it.thumbUrl);
+  it.el.remove(); keys.delete(it.key);
+  items = items.filter(function (x) { return x !== it; });
+  renameAll(); updateSummary(); updateProgress();
+  if (!items.length) clearAll(true);
+}
+
+/* ---------- toolbar ---------- */
+$('#filters').addEventListener('click', function (e) {
+  var b = e.target.closest('[data-f]'); if (!b) return;
+  filter = b.dataset.f;
+  $$('#filters .chip').forEach(function (c) { c.setAttribute('aria-pressed', String(c === b)); });
+  items.forEach(applyFilter);
+});
+$('.bulk').addEventListener('click', function (e) {
+  var b = e.target.closest('[data-bulk]'); if (!b) return;
+  var mode = b.dataset.bulk, n = 0;
+  items.forEach(function (it) {
+    if (it.status !== 'done' || it.el.classList.contains('hide')) return;
+    var fmt = mode === 'rec' ? it.result.rec : mode;
+    if (cand(it, fmt) && it.choice !== fmt) { it.choice = fmt; n++; }
+  });
+  renameAll(); items.forEach(function (it) { if (it.status === 'done') renderRow(it); }); updateSummary();
+  toast(n ? n + '件の形式を変えました' : '変更はありませんでした');
+});
+$('#clearAll').addEventListener('click', function () {
+  if (isRunning() && !confirm('処理中です。すべて消去しますか？')) return;
+  clearAll(false);
+});
+function clearAll(silent) {
+  destroyPool();
+  items.forEach(function (it) { if (it.thumbUrl) URL.revokeObjectURL(it.thumbUrl); });
+  items = []; keys.clear(); $('#list').innerHTML = '';
+  $('#results').hidden = true; $('#progress').hidden = true; $('#savebar').hidden = true;
+  runStart = 0; dirty = false; $('#sApply').hidden = true; $('#dirtyNote').hidden = true;
+  if (!silent) toast('消去しました');
+}
+function reprocessAll() {
+  destroyPool();
+  items.forEach(function (it) {
+    if (it.thumbUrl) URL.revokeObjectURL(it.thumbUrl);
+    it.thumbUrl = null; it.result = null; it.choice = null; it.status = 'queued'; it.stage = ''; it.error = ''; it.outName = '';
+    renderRow(it);
+  });
+  dirty = false; $('#sApply').hidden = true; $('#dirtyNote').hidden = true;
+  runStart = 0; startRun();
+}
+
+/* ---------- summary / save bar ---------- */
+function updateSummary() {
+  var done = items.filter(function (it) { return it.status === 'done'; });
+  var nP = 0, nJ = 0, inB = 0, outB = 0;
+  done.forEach(function (it) { var c = cand(it, it.choice); if (it.choice === 'png') nP++; else nJ++; inB += it.result.fileSize; outB += c.size; });
+  var counts = { all: items.length, attn: items.filter(isAttn).length, shrink: items.filter(isShrunk).length, err: items.filter(function (it) { return it.status === 'error'; }).length };
+  $$('#filters [data-c]').forEach(function (s) { s.textContent = counts[s.dataset.c]; });
+  $('#stats').innerHTML = done.length
+    ? '<span>PNG <b>' + nP + '</b>件 ・ JPEG <b>' + nJ + '</b>件</span><span>合計 <b>' + fmtBig(inB) + '</b> → <b>' + fmtBig(outB) + '</b></span>' + (counts.attn ? '<span>要確認 <b>' + counts.attn + '</b>件</span>' : '')
+    : '<span>変換結果がここに並びます</span>';
+  var bar = $('#savebar'), running = isRunning();
+  bar.hidden = !done.length;
+  $('#saveMsg').innerHTML = running ? '処理が終わると保存できます（完了 <b>' + done.length + '</b> 件）' : '<b>' + done.length + '</b> 件を保存できます' + (counts.err ? '（エラーの ' + counts.err + ' 件は含みません）' : '');
+  ['#saveZip', '#saveEach', '#saveDir'].forEach(function (id) { $(id).disabled = running || !done.length; });
+}
+function outputs() {
+  return items.filter(function (it) { return it.status === 'done'; }).map(function (it) { var c = cand(it, it.choice); return { name: it.outName, blob: c.blob, crc: c.crc }; });
+}
+function saveBlob(blob, name) {
+  var url = URL.createObjectURL(blob), a = document.createElement('a');
+  a.href = url; a.download = name; document.body.appendChild(a); a.click(); a.remove();
+  setTimeout(function () { URL.revokeObjectURL(url); }, 15000);
+}
+function stamp() { var d = new Date(), p = function (n) { return String(n).padStart(2, '0'); }; return d.getFullYear() + p(d.getMonth() + 1) + p(d.getDate()) + '-' + p(d.getHours()) + p(d.getMinutes()); }
+function buildZip(entries) {
+  var enc = new TextEncoder(), d = new Date(), parts = [], cds = [], offset = 0, cdSize = 0;
+  var time = (d.getHours() << 11) | (d.getMinutes() << 5) | (d.getSeconds() >> 1);
+  var date = ((d.getFullYear() - 1980) << 9) | ((d.getMonth() + 1) << 5) | d.getDate();
+  entries.forEach(function (e) {
+    var nb = enc.encode(e.name), size = e.blob.size;
+    var h = new DataView(new ArrayBuffer(30));
+    h.setUint32(0, 0x04034b50, true); h.setUint16(4, 20, true); h.setUint16(6, 0x0800, true); h.setUint16(8, 0, true);
+    h.setUint16(10, time, true); h.setUint16(12, date, true); h.setUint32(14, e.crc >>> 0, true);
+    h.setUint32(18, size, true); h.setUint32(22, size, true); h.setUint16(26, nb.length, true); h.setUint16(28, 0, true);
+    parts.push(h.buffer, nb, e.blob);
+    var c = new DataView(new ArrayBuffer(46));
+    c.setUint32(0, 0x02014b50, true); c.setUint16(4, 20, true); c.setUint16(6, 20, true); c.setUint16(8, 0x0800, true); c.setUint16(10, 0, true);
+    c.setUint16(12, time, true); c.setUint16(14, date, true); c.setUint32(16, e.crc >>> 0, true); c.setUint32(20, size, true); c.setUint32(24, size, true);
+    c.setUint16(28, nb.length, true); c.setUint16(30, 0, true); c.setUint16(32, 0, true); c.setUint16(34, 0, true); c.setUint16(36, 0, true);
+    c.setUint32(38, 0, true); c.setUint32(42, offset, true);
+    cds.push(c.buffer, nb); cdSize += 46 + nb.length;
+    offset += 30 + nb.length + size;
+  });
+  var z = new DataView(new ArrayBuffer(22));
+  z.setUint32(0, 0x06054b50, true); z.setUint16(4, 0, true); z.setUint16(6, 0, true); z.setUint16(8, entries.length, true); z.setUint16(10, entries.length, true);
+  z.setUint32(12, cdSize, true); z.setUint32(16, offset, true); z.setUint16(20, 0, true);
+  return new Blob(parts.concat(cds, [z.buffer]), { type: 'application/zip' });
+}
+$('#saveZip').addEventListener('click', function () {
+  var list = outputs(); if (!list.length) return;
+  saveBlob(buildZip(list), 'images-' + stamp() + '.zip');
+  toast(list.length + '件をZIPにまとめて保存しました');
+});
+$('#saveEach').addEventListener('click', async function () {
+  var list = outputs(), btn = this; if (!list.length) return;
+  btn.disabled = true;
+  toast('1件ずつ保存します。「複数のファイルのダウンロード」の確認が出たら許可してください。', 5000);
+  for (var i = 0; i < list.length; i++) { saveBlob(list[i].blob, list[i].name); $('#saveMsg').innerHTML = '保存中 <b>' + (i + 1) + ' / ' + list.length + '</b>'; await sleep(350); }
+  btn.disabled = false; updateSummary(); toast(list.length + '件の保存を指示しました');
+});
+$('#saveDir').addEventListener('click', async function () {
+  var list = outputs(); if (!list.length) return;
+  var dir;
+  try { dir = await window.showDirectoryPicker({ mode: 'readwrite' }); }
+  catch (e) { if (e && e.name !== 'AbortError') toast('フォルダを開けませんでした。ZIPまたは1件ずつ保存を使ってください。', 5000); return; }
+  try {
+    var exists = [];
+    for (var i = 0; i < list.length; i++) { try { await dir.getFileHandle(list[i].name); exists.push(list[i].name); } catch (e) {} }
+    if (exists.length && !confirm('このフォルダには同じ名前のファイルが ' + exists.length + ' 件あります（例：' + exists[0] + '）。上書きしますか？')) return;
+    for (i = 0; i < list.length; i++) {
+      var fh = await dir.getFileHandle(list[i].name, { create: true }), ws = await fh.createWritable();
+      await ws.write(list[i].blob); await ws.close();
+      $('#saveMsg').innerHTML = '保存中 <b>' + (i + 1) + ' / ' + list.length + '</b>';
+    }
+    toast(list.length + '件をフォルダ「' + dir.name + '」に保存しました');
+  } catch (e) {
+    toast('フォルダへの保存に失敗しました（' + (e && e.message || e) + '）。ZIPまたは1件ずつ保存を使ってください。', 6000);
+  }
+  updateSummary();
+});
+
+/* ---------- compare dialog ---------- */
+var cmp = { it: null, urls: {}, ver: 'orig', zoom: 'fit' };
+var dlg = $('#cmp'), cImg = $('#cmpImg');
+function openCmp(it) {
+  revokeCmp();
+  var r = it.result; cmp.it = it; cmp.urls = { orig: URL.createObjectURL(it.file) };
+  if (cand(it, 'png')) cmp.urls.png = URL.createObjectURL(r.png.blob);
+  if (cand(it, 'jpeg')) cmp.urls.jpeg = URL.createObjectURL(r.jpg.blob);
+  cmp.ver = it.choice; cmp.zoom = 'fit';
+  $('#cmpTitle').textContent = it.name;
+  $$('#cmpVer button').forEach(function (b) { b.disabled = !cmp.urls[b.dataset.v]; });
+  showVer();
+  if (dlg.showModal) dlg.showModal(); else dlg.setAttribute('open', '');
+  applyZoom();
+}
+function revokeCmp() { Object.keys(cmp.urls).forEach(function (k) { URL.revokeObjectURL(cmp.urls[k]); }); cmp.urls = {}; }
+function showVer() {
+  var it = cmp.it, r = it.result, v = cmp.ver, info = '';
+  cImg.src = cmp.urls[v];
+  $$('#cmpVer button').forEach(function (b) { b.setAttribute('aria-pressed', String(b.dataset.v === v)); });
+  if (v === 'orig') info = '<b>元画像</b> ・ ' + r.W + '×' + r.H + ' ・ ' + fmtKB(r.fileSize) + (r.hasAlpha ? ' ・ 透過あり（市松模様の部分）' : '');
+  else {
+    var c = cand(it, v), label = v === 'png' ? 'PNG' : 'JPEG';
+    info = '<b>' + label + '</b> ・ ' + fmtKB(c.size) + ' ・ ' + c.w + '×' + c.h + '（' + pct(c.w / r.W) + '）・ ' +
+      (c.mode === 'pass' ? '無加工' : v === 'png' ? c.colors + '色' : '品質 ' + c.quality) + ' ・ 画質スコア ' + c.score.toFixed(1);
+    if (r.rec === v) info += ' ・ 推奨（' + esc(r.reason) + '）';
+    if (v === 'jpeg' && r.hasAlpha) info += ' <span class="warn">透過部分は白になります</span>';
+  }
+  $('#cmpInfo').innerHTML = info;
+  $('#cmpAdopt').disabled = v === 'orig' || it.choice === v;
+  $('#cmpAdopt').textContent = v !== 'orig' && it.choice === v ? '採用中' : 'この形式を採用';
+}
+function applyZoom() {
+  var W = cmp.it.result.W, z = cmp.zoom;
+  $$('#cmpZoom button').forEach(function (b) { b.setAttribute('aria-pressed', String(b.dataset.z === z)); });
+  // どの版も「元画像の大きさ」で表示するので、縮小した版も同じ位置で見比べられる
+  if (z === 'fit') {
+    var v = $('#cmpView'), H = cmp.it.result.H;
+    var k0 = Math.min(1, (v.clientWidth - 24) / W, (v.clientHeight - 24) / H);
+    cImg.style.width = Math.max(1, Math.floor(W * k0)) + 'px'; cImg.classList.remove('pix');
+  } else { var k = Number(z); cImg.style.width = (W * k) + 'px'; cImg.classList.toggle('pix', k >= 2); }
+}
+window.addEventListener('resize', function () { if (cmp.it && cmp.zoom === 'fit') applyZoom(); });
+$('#cmpVer').addEventListener('click', function (e) { var b = e.target.closest('[data-v]'); if (b && !b.disabled) { cmp.ver = b.dataset.v; showVer(); } });
+$('#cmpZoom').addEventListener('click', function (e) { var b = e.target.closest('[data-z]'); if (b) { cmp.zoom = b.dataset.z; applyZoom(); } });
+$('#cmpAdopt').addEventListener('click', function () { if (cmp.ver !== 'orig') { setChoice(cmp.it, cmp.ver); showVer(); } });
+$('#cmpClose').addEventListener('click', function () { dlg.close ? dlg.close() : dlg.removeAttribute('open'); });
+dlg.addEventListener('close', function () { cImg.removeAttribute('src'); revokeCmp(); cmp.it = null; });
+dlg.addEventListener('keydown', function (e) {
+  var map = { '1': 'orig', '2': 'png', '3': 'jpeg' }, v = map[e.key];
+  if (v && cmp.urls[v]) { cmp.ver = v; showVer(); e.preventDefault(); }
+});
+dlg.addEventListener('click', function (e) { if (e.target === dlg) dlg.close(); });
+
+window.addEventListener('beforeunload', function (e) { if (isRunning()) { e.preventDefault(); e.returnValue = ''; } });
+
+settingsToForm();
+updateSummary();
+
+// テスト・確認用（動作には影響しない）
+window.__imgTool = { items: function () { return items; }, isRunning: isRunning, outputs: outputs, buildZip: buildZip, pool: function () { return pool && pool.mode; } };
+})();
+</script>
+</body>
+</html>
