@@ -54,6 +54,8 @@
    同名が衝突したら _2, _3 … を付ける（大文字小文字は区別しない）。
    ZIPは自前で組み立てる無圧縮格納（中身は圧縮済みの画像なので無圧縮で十分）。
    上限は初期値で 1KB=1000バイト（厳しい側）で判定する。設定で1024バイトにも切り替えられる。
+   出力ファイル名の一覧を CSV（1列・見出しなし、BOM付きUTF-8、CRLF）でも保存できる。
+   各行の先頭に任意の文字（例：img/）を付けられるので、Webサーバ上のパスとして他のCSVに貼り付けられる。
 ==========================================================================
 -->
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect x='3' y='5' width='26' height='22' rx='4' fill='%231f5bd6'/%3E%3Cpath d='M7 23l6-7 4 4 3-3 5 6z' fill='%23fff'/%3E%3Ccircle cx='21' cy='11' r='2.5' fill='%23fff'/%3E%3C/svg%3E">
@@ -259,6 +261,10 @@ details.panel > summary .sumnote { margin-left: auto; font-weight: 400; color: v
 .save-msg { color: var(--muted); font-size: 13px; }
 .save-msg b { color: var(--ink); }
 .save-btns { display: flex; flex-wrap: wrap; gap: 8px; margin-left: auto; }
+.csv-row { flex: 1 1 100%; display: flex; flex-wrap: wrap; align-items: center; gap: 6px 10px; padding-top: 8px; border-top: 1px solid var(--line); font-size: 13px; color: var(--muted); }
+.csv-row input { width: 180px; min-height: 30px; padding: 2px 8px; border-radius: 7px; border: 1px solid var(--line-strong); background: var(--surface); color: var(--ink); font: inherit; }
+.csv-eg { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
+.csv-row .btn { margin-left: auto; }
 
 /* ---------- compare dialog ---------- */
 dialog.cmp { width: min(1120px, 96vw); height: min(92vh, 980px); max-height: 92vh; padding: 0; border: 1px solid var(--line); border-radius: 14px; background: var(--surface); color: var(--ink); box-shadow: 0 20px 60px rgba(0,0,0,.3); }
@@ -305,6 +311,8 @@ dialog.cmp::backdrop { background: rgba(10,14,22,.55); }
   .fields { grid-template-columns: 1fr; }
   .save-btns { margin-left: 0; width: 100%; }
   .save-btns .btn { flex: 1 1 auto; }
+  .csv-row input { flex: 1 1 auto; width: auto; }
+  .csv-row .btn { margin-left: 0; width: 100%; }
   .top .pill { margin-left: 0; }
 }
 @media (prefers-reduced-motion: reduce) { .spin { animation: none; } .bar-fill, .drop { transition: none; } }
@@ -440,6 +448,12 @@ dialog.cmp::backdrop { background: rgba(10,14,22,.55); }
       <button type="button" class="btn primary" id="saveZip">ZIPでまとめて保存</button>
       <button type="button" class="btn" id="saveDir" hidden>フォルダを選んで保存</button>
       <button type="button" class="btn" id="saveEach">1件ずつ保存</button>
+    </div>
+    <div class="csv-row">
+      <label for="csvPrefix">ファイル名一覧（CSV）の前に付ける文字</label>
+      <input type="text" id="csvPrefix" placeholder="例：img/" spellcheck="false" autocomplete="off">
+      <span class="csv-eg num" id="csvEg"></span>
+      <button type="button" class="btn small" id="saveCsv">ファイル名をCSVで保存</button>
     </div>
   </div>
 </div>
@@ -1417,7 +1431,8 @@ function updateSummary() {
   var bar = $('#savebar'), running = isRunning();
   bar.hidden = !done.length;
   $('#saveMsg').innerHTML = running ? '処理が終わると保存できます（完了 <b>' + done.length + '</b> 件）' : '<b>' + done.length + '</b> 件を保存できます' + (counts.err ? '（エラーの ' + counts.err + ' 件は含みません）' : '');
-  ['#saveZip', '#saveEach', '#saveDir'].forEach(function (id) { $(id).disabled = running || !done.length; });
+  ['#saveZip', '#saveEach', '#saveDir', '#saveCsv'].forEach(function (id) { $(id).disabled = running || !done.length; });
+  renderCsvEg();
 }
 function outputs() {
   return items.filter(function (it) { return it.status === 'done'; }).map(function (it) { var c = cand(it, it.choice); return { name: it.outName, blob: c.blob, crc: c.crc }; });
@@ -1485,6 +1500,32 @@ $('#saveDir').addEventListener('click', async function () {
   updateSummary();
 });
 
+/* ---------- ファイル名一覧（CSV） ---------- */
+// Webサーバ上の画像パスとして他のCSVに貼り付けられるよう、出力ファイル名を1列（見出しなし）で書き出す。
+// Excelで開いても文字化けしないようBOM付きUTF-8、改行はCRLF。
+var PREFIX_KEY = 'image-compressor.csvPrefix.v1';
+var csvPrefix = $('#csvPrefix');
+try { csvPrefix.value = localStorage.getItem(PREFIX_KEY) || ''; } catch (e) {}
+csvPrefix.addEventListener('input', function () {
+  try { localStorage.setItem(PREFIX_KEY, csvPrefix.value); } catch (e) {}
+  renderCsvEg();
+});
+function csvLines() {
+  var pre = csvPrefix.value;
+  return outputs().map(function (o) { return pre + o.name; });
+}
+function csvCell(s) { return /[",\r\n]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s; }
+function renderCsvEg() {
+  var first = outputs()[0];
+  $('#csvEg').textContent = first ? '→ ' + csvPrefix.value + first.name : '';
+}
+$('#saveCsv').addEventListener('click', function () {
+  var lines = csvLines(); if (!lines.length) return;
+  var text = '﻿' + lines.map(csvCell).join('\r\n') + '\r\n';
+  saveBlob(new Blob([text], { type: 'text/csv;charset=utf-8' }), 'filenames-' + stamp() + '.csv');
+  toast(lines.length + '件のファイル名をCSVで保存しました');
+});
+
 /* ---------- compare dialog ---------- */
 var cmp = { it: null, urls: {}, ver: 'orig', zoom: 'fit' };
 var dlg = $('#cmp'), cImg = $('#cmpImg');
@@ -1545,7 +1586,7 @@ settingsToForm();
 updateSummary();
 
 // テスト・確認用（動作には影響しない）
-window.__imgTool = { items: function () { return items; }, isRunning: isRunning, outputs: outputs, buildZip: buildZip, pool: function () { return pool && pool.mode; } };
+window.__imgTool = { items: function () { return items; }, isRunning: isRunning, outputs: outputs, buildZip: buildZip, csvLines: csvLines, pool: function () { return pool && pool.mode; } };
 })();
 </script>
 </body>
