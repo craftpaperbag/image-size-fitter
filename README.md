@@ -29,6 +29,18 @@ PNG / JPEG 画像を、指定したファイルサイズの上限以内に一括
 
 Web Worker、OffscreenCanvas、CompressionStream に対応したブラウザ（Edge / Chrome の最新版など）。
 
+## テスト（開発用）
+
+ツール自体は外部依存なしで動きます。テストだけ Playwright を使います。
+
+```sh
+npm install
+npx playwright install chromium
+npm test
+```
+
+スクリーンショットは `tests/output/` に保存されます。
+
 ## ライセンス
 
 MIT License（`LICENSE` を参照）
